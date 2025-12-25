@@ -909,314 +909,290 @@ void platform_get_input(long param_1, void *param_2, int param_3) {
 }
 
 // CPU 模拟 - 解释器模式
-// 基于 drastic.cpp 中 cpu_next_action_arm7_to_event_update 的实现（第25305行）
+// 基于 drastic.cpp 中 cpu_next_action_arm7_to_event_update 的实现(第25305行)
 // 该函数负责执行 ARM7 和 ARM9 CPU 直到下一个事件
+//
+// 修复说明:
+// param_1 在调用时传入的是 nds_system 的地址(绝对地址)
+// 但在实现中需要计算相对于 nds_system 的偏移量来访问数据
 void cpu_next_action_arm7_to_event_update(long param_1) {
-    // 根据 drastic.cpp 第25305-25477行的实现
-    // param_1 是相对于 nds_system 的偏移量（不是绝对地址）
-    // 所有访问都应该使用 nds_system + param_1 + offset 的形式
+    // 计算相对于 nds_system 的偏移量
+    unsigned long system_base = (unsigned long)nds_system;
+    long system_offset = param_1 - system_base;  // 应该是 0x320
     
     uint32_t uVar1, uVar2, uVar5, uVar6;
     int iVar3, iVar4, iVar7;
     
-    // 执行事件（根据 drastic.cpp 第25316行）
+    // 执行事件
     execute_events_no_param();
     
-    // ARM7 CPU 状态检查（偏移 0x10cde58）
-    // 根据 drastic.cpp 第25317行：*(int *)(nds_system + param_1 + 0x10cde58)
-    if (*(int *)(nds_system + param_1 + 0x10cde58) != 0) {
-        // 根据 drastic.cpp 第25318-25322行
-        uVar1 = *(uint32_t *)(nds_system + param_1 + 0x10ce110);
-        uVar2 = *(uint32_t *)(nds_system + param_1 + 0x10cde60);
-        *(uint32_t *)(nds_system + param_1 + 0x10cde60) = 0;
-        *(uint32_t *)(nds_system + param_1 + 0x10cdff8) = 0;
-        iVar3 = *(int *)(nds_system + param_1 + 0x10cde5c);
+    // ARM7 CPU 状态检查
+    if (*(int *)(nds_system + system_offset + 0x10cde58) != 0) {
+        // ARM7 中断处理
+        uVar1 = *(uint32_t *)(nds_system + system_offset + 0x10ce110);
+        uVar2 = *(uint32_t *)(nds_system + system_offset + 0x10cde60);
+        *(uint32_t *)(nds_system + system_offset + 0x10cde60) = 0;
+        *(uint32_t *)(nds_system + system_offset + 0x10cdff8) = 0;
+        iVar3 = *(int *)(nds_system + system_offset + 0x10cde5c);
         
-        // 根据 drastic.cpp 第25323行
         if ((uVar1 >> 7 & 1) == 0) {
             // 不在中断模式
-            uVar5 = *(uint32_t *)(nds_system + param_1 + 0x10ce10c);
-            uVar6 = *(uint32_t *)(nds_system + param_1 + 0x10cde54);
+            uVar5 = *(uint32_t *)(nds_system + system_offset + 0x10ce10c);
+            uVar6 = *(uint32_t *)(nds_system + system_offset + 0x10cde54);
             
-            // 根据 drastic.cpp 第25326行
             if ((uVar5 & 1) == 0) {
+                // ARM 模式
                 iVar7 = uVar5 + 4;
                 if (uVar6 != 2) {
-                    // 根据 drastic.cpp 第25341行
-                    *(uint64_t *)(nds_system + param_1 + (unsigned long)uVar6 * 8 + 0x10cdde0) =
-                         *(uint64_t *)(nds_system + param_1 + 0x10ce0f4);
+                    *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x10cdde0) =
+                         *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
                     if (uVar6 == 1) {
-                        // 根据 drastic.cpp 第25344-25360行，处理 FIQ 模式寄存器组
-                        if (param_1 + 0x15c9e18U < param_1 + 0x15ca0f0U &&
-                            param_1 + 0x15ca0e0U < param_1 + 0x15c9e28U) {
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde18);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde20);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde28);
+                        // FIQ 模式寄存器组
+                        if (system_offset + 0x15c9e18U < system_offset + 0x15ca0f0U &&
+                            system_offset + 0x15ca0e0U < system_offset + 0x15c9e28U) {
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         } else {
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde20);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde18);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde28);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         }
                     } else {
-                        // 根据 drastic.cpp 第25363行
-                        *(uint32_t *)(nds_system + param_1 + 0x10ce0f4) =
-                             *(uint32_t *)(nds_system + param_1 + 0x10cddf0);
+                        *(uint32_t *)(nds_system + system_offset + 0x10ce0f4) =
+                             *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
                     }
-                    *(uint32_t *)(nds_system + param_1 + 0x10cde54) = 2;
-                    *(int *)(nds_system + param_1 + 0x10ce0f8) = iVar7;
+                    *(uint32_t *)(nds_system + system_offset + 0x10cde54) = 2;
+                    *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
                 } else {
-                    // 根据 drastic.cpp 第25329行
-                    *(int *)(nds_system + param_1 + 0x10ce0f8) = iVar7;
+                    *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
                 }
-                // 根据 drastic.cpp 第25331行
-                *(uint32_t *)(nds_system + param_1 + 0x10cde40) = uVar1;
+                *(uint32_t *)(nds_system + system_offset + 0x10cde40) = uVar1;
             } else {
-                // 根据 drastic.cpp 第25334-25370行
-                *(uint32_t *)(nds_system + param_1 + 0x10ce10c) = uVar5 & 0xfffffffe;
+                // Thumb 模式
+                *(uint32_t *)(nds_system + system_offset + 0x10ce10c) = uVar5 & 0xfffffffe;
                 iVar7 = (uVar5 & 0xfffffffe) + 4;
                 if (uVar6 == 2) {
-                    *(int *)(nds_system + param_1 + 0x10ce0f8) = iVar7;
+                    *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
                 } else {
-                    *(uint64_t *)(nds_system + param_1 + (unsigned long)uVar6 * 8 + 0x10cdde0) =
-                         *(uint64_t *)(nds_system + param_1 + 0x10ce0f4);
+                    *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x10cdde0) =
+                         *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
                     if (uVar6 == 1) {
-                        if (param_1 + 0x15c9e18U < param_1 + 0x15ca0f0U &&
-                            param_1 + 0x15ca0e0U < param_1 + 0x15c9e28U) {
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde18);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde20);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde28);
+                        if (system_offset + 0x15c9e18U < system_offset + 0x15ca0f0U &&
+                            system_offset + 0x15ca0e0U < system_offset + 0x15c9e28U) {
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         } else {
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde20);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde18);
-                            *(uint64_t *)(nds_system + param_1 + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + param_1 + 0x10cde28);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                            *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
+                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         }
                     } else {
-                        *(uint32_t *)(nds_system + param_1 + 0x10ce0f4) =
-                             *(uint32_t *)(nds_system + param_1 + 0x10cddf0);
+                        *(uint32_t *)(nds_system + system_offset + 0x10ce0f4) =
+                             *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
                     }
-                    *(uint32_t *)(nds_system + param_1 + 0x10cde54) = 2;
-                    *(int *)(nds_system + param_1 + 0x10ce0f8) = iVar7;
+                    *(uint32_t *)(nds_system + system_offset + 0x10cde54) = 2;
+                    *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
                     if ((uVar5 & 1) == 0) {
-                        *(uint32_t *)(nds_system + param_1 + 0x10cde40) = uVar1;
+                        *(uint32_t *)(nds_system + system_offset + 0x10cde40) = uVar1;
                     } else {
-                        *(uint32_t *)(nds_system + param_1 + 0x10cde40) = uVar1 | 0x20;
+                        *(uint32_t *)(nds_system + system_offset + 0x10cde40) = uVar1 | 0x20;
                     }
                 }
                 if ((uVar5 & 1) != 0) {
-                    *(uint32_t *)(nds_system + param_1 + 0x10cde40) = uVar1 | 0x20;
+                    *(uint32_t *)(nds_system + system_offset + 0x10cde40) = uVar1 | 0x20;
                 }
             }
             
-            // 根据 drastic.cpp 第25372-25377行
+            // 设置中断向量
             iVar7 = 0x18;
             if (iVar3 == 1) {
-                iVar7 = *(int *)(*(long *)(nds_system + param_1 + 0x10cdfa0) + 0x10) + 0x18;
+                iVar7 = *(int *)(*(long *)(nds_system + system_offset + 0x10cdfa0) + 0x10) + 0x18;
             }
-            *(int *)(nds_system + param_1 + 0x10ce10c) = iVar7;
-            *(uint32_t *)(nds_system + param_1 + 0x10ce110) = uVar1 & 0xffffffc0 | 0x92;
+            *(int *)(nds_system + system_offset + 0x10ce10c) = iVar7;
+            *(uint32_t *)(nds_system + system_offset + 0x10ce110) = uVar1 & 0xffffffc0 | 0x92;
             
-            // 根据 drastic.cpp 第25378行
             if (iVar3 == 0 && uVar2 != 0) {
                 goto LAB_ARM7_TASK_SWITCH;
             }
         } else {
-            // 在中断模式，根据 drastic.cpp 第25380行
+            // 在中断模式
             if (iVar3 == 0 && uVar2 != 0) {
 LAB_ARM7_TASK_SWITCH:
-                // 根据 drastic.cpp 第25382-25386行
                 if (1 < uVar2) {
-                    *(uint32_t *)(*(long *)(nds_system + param_1 + 0x10cdff0) + 0x2110) =
-                         *(uint32_t *)(*(long *)(nds_system + param_1 + 0x10cdff0) + 0x2110) & 0xfffffffd;
+                    *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) =
+                         *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) & 0xfffffffd;
                 }
-                // 注意：event_force_task_switch_function 需要根据实际实现调用
-                // 根据 drastic.cpp 第25386行
-                // event_force_task_switch_function(*(undefined8 *)(nds_system + param_1 + 0x10cdfa8), 0);
+                // 调用任务切换函数
+                // event_force_task_switch_function(*(undefined8 *)(nds_system + system_offset + 0x10cdfa8), 0);
             }
         }
     }
     
-    // ARM9 CPU 状态检查，根据 drastic.cpp 第25389行
-    if (*(int *)(nds_system + param_1 + 0x20d4448) == 0) goto LAB_FINAL;
+    // ARM9 CPU 状态检查
+    if (*(int *)(nds_system + system_offset + 0x20d4448) == 0) goto LAB_FINAL;
     
-    // 根据 drastic.cpp 第25390-25394行
-    uVar1 = *(uint32_t *)(nds_system + param_1 + 0x20d4700);
-    uVar2 = *(uint32_t *)(nds_system + param_1 + 0x20d4450);
-    *(uint32_t *)(nds_system + param_1 + 0x20d4450) = 0;
-    *(uint32_t *)(nds_system + param_1 + 0x20d45e8) = 0;
-    iVar3 = *(int *)(nds_system + param_1 + 0x20d444c);
+    // ARM9 中断处理(结构与 ARM7 类似)
+    uVar1 = *(uint32_t *)(nds_system + system_offset + 0x20d4700);
+    uVar2 = *(uint32_t *)(nds_system + system_offset + 0x20d4450);
+    *(uint32_t *)(nds_system + system_offset + 0x20d4450) = 0;
+    *(uint32_t *)(nds_system + system_offset + 0x20d45e8) = 0;
+    iVar3 = *(int *)(nds_system + system_offset + 0x20d444c);
     
-    // 根据 drastic.cpp 第25395行
     if ((uVar1 >> 7 & 1) == 0) {
-        uVar5 = *(uint32_t *)(nds_system + param_1 + 0x20d46fc);
-        uVar6 = *(uint32_t *)(nds_system + param_1 + 0x20d4444);
+        uVar5 = *(uint32_t *)(nds_system + system_offset + 0x20d46fc);
+        uVar6 = *(uint32_t *)(nds_system + system_offset + 0x20d4444);
         
-        // 根据 drastic.cpp 第25398行
         if ((uVar5 & 1) == 0) {
+            // ARM 模式
             iVar7 = uVar5 + 4;
             if (uVar6 != 2) {
-                // 根据 drastic.cpp 第25413行
-                *(uint64_t *)(nds_system + param_1 + (unsigned long)uVar6 * 8 + 0x20d43d0) =
-                     *(uint64_t *)(nds_system + param_1 + 0x20d46e4);
+                *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
+                     *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
                 if (uVar6 == 1) {
-                    // 根据 drastic.cpp 第25416-25432行，处理 FIQ 模式寄存器组
-                    if (param_1 + 0x25d0408U < param_1 + 0x25d06e0U &&
-                        param_1 + 0x25d06d0U < param_1 + 0x25d0418U) {
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4408);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4410);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4418);
+                    if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
+                        system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
                     } else {
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4418);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4410);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4408);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
                     }
                 } else {
-                    // 根据 drastic.cpp 第25435行
-                    *(uint32_t *)(nds_system + param_1 + 0x20d46e4) =
-                         *(uint32_t *)(nds_system + param_1 + 0x20d43e0);
+                    *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
+                         *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
                 }
-                *(uint32_t *)(nds_system + param_1 + 0x20d4444) = 2;
-                *(int *)(nds_system + param_1 + 0x20d46e8) = iVar7;
+                *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
+                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
             } else {
-                // 根据 drastic.cpp 第25401行
-                *(int *)(nds_system + param_1 + 0x20d46e8) = iVar7;
+                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
             }
-            // 根据 drastic.cpp 第25403行
-            *(uint32_t *)(nds_system + param_1 + 0x20d4430) = uVar1;
+            *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
         } else {
-            // 根据 drastic.cpp 第25406-25441行
-            *(uint32_t *)(nds_system + param_1 + 0x20d46fc) = uVar5 & 0xfffffffe;
+            // Thumb 模式
+            *(uint32_t *)(nds_system + system_offset + 0x20d46fc) = uVar5 & 0xfffffffe;
             iVar7 = (uVar5 & 0xfffffffe) + 4;
             if (uVar6 == 2) {
-                *(int *)(nds_system + param_1 + 0x20d46e8) = iVar7;
+                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
             } else {
-                *(uint64_t *)(nds_system + param_1 + (unsigned long)uVar6 * 8 + 0x20d43d0) =
-                     *(uint64_t *)(nds_system + param_1 + 0x20d46e4);
+                *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
+                     *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
                 if (uVar6 == 1) {
-                    if (param_1 + 0x25d0408U < param_1 + 0x25d06e0U &&
-                        param_1 + 0x25d06d0U < param_1 + 0x25d0418U) {
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4408);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4410);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4418);
+                    if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
+                        system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
                     } else {
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4418);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4410);
-                        *(uint64_t *)(nds_system + param_1 + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + param_1 + 0x20d4408);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
                     }
                 } else {
-                    *(uint32_t *)(nds_system + param_1 + 0x20d46e4) =
-                         *(uint32_t *)(nds_system + param_1 + 0x20d43e0);
+                    *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
+                         *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
                 }
-                *(uint32_t *)(nds_system + param_1 + 0x20d4444) = 2;
-                *(int *)(nds_system + param_1 + 0x20d46e8) = iVar7;
+                *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
+                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
                 if ((uVar5 & 1) == 0) {
-                    *(uint32_t *)(nds_system + param_1 + 0x20d4430) = uVar1;
+                    *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
                 } else {
-                    *(uint32_t *)(nds_system + param_1 + 0x20d4430) = uVar1 | 0x20;
+                    *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1 | 0x20;
                 }
             }
             if ((uVar5 & 1) != 0) {
-                *(uint32_t *)(nds_system + param_1 + 0x20d4430) = uVar1 | 0x20;
+                *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1 | 0x20;
             }
         }
         
-        // 根据 drastic.cpp 第25444-25449行
+        // 设置中断向量
         iVar7 = 0x18;
         if (iVar3 == 1) {
-            iVar7 = *(int *)(*(long *)(nds_system + param_1 + 0x20d4590) + 0x10) + 0x18;
+            iVar7 = *(int *)(*(long *)(nds_system + system_offset + 0x20d4590) + 0x10) + 0x18;
         }
-        *(int *)(nds_system + param_1 + 0x20d46fc) = iVar7;
-        *(uint32_t *)(nds_system + param_1 + 0x20d4700) = uVar1 & 0xffffffc0 | 0x92;
+        *(int *)(nds_system + system_offset + 0x20d46fc) = iVar7;
+        *(uint32_t *)(nds_system + system_offset + 0x20d4700) = uVar1 & 0xffffffc0 | 0x92;
         
-        // 根据 drastic.cpp 第25450行
         if (iVar3 != 0 || uVar2 == 0) goto LAB_FINAL;
     } else {
-        // 在中断模式，根据 drastic.cpp 第25452行
+        // 在中断模式
         if (iVar3 != 0 || uVar2 == 0) goto LAB_FINAL;
     }
     
-    // ARM9 任务切换处理，根据 drastic.cpp 第25453-25457行
+    // ARM9 任务切换处理
     if (1 < uVar2) {
-        *(uint32_t *)(*(long *)(nds_system + param_1 + 0x20d45e0) + 0x2110) =
-             *(uint32_t *)(*(long *)(nds_system + param_1 + 0x20d45e0) + 0x2110) & 0xfffffffd;
+        *(uint32_t *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) =
+             *(uint32_t *)(*(long *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) & 0xfffffffd;
     }
-    // 注意：event_force_task_switch_function 需要根据实际实现调用
-    // 根据 drastic.cpp 第25457行
-    // event_force_task_switch_function(*(undefined8 *)(nds_system + param_1 + 0x20d4598), 0);
+    // event_force_task_switch_function(*(undefined8 *)(nds_system + system_offset + 0x20d4598), 0);
     
 LAB_FINAL:
-    // 根据 drastic.cpp 第25459-25476行
-    // 注意：第25459行使用 param_1 + 0x318（直接使用 param_1 作为指针）
-    // 第25462行使用 param_1 + 0x10（直接使用 param_1）
-    // 第25471行使用 param_1 + 0x15c7d50（直接使用 param_1）
-    // 但其他行使用 nds_system + param_1 + offset
-    // 这说明 param_1 可能是偏移量，但在某些情况下直接使用
-    // 或者 param_1 是指针，但在某些情况下需要加上 nds_system
-    // 根据调用方式（第4964行：cpu_next_action_arm7_to_event_update(nds_system)），
-    // param_1 应该是 nds_system 的地址或指向 nds_system 的指针
+    // 最终处理阶段：更新时间计数器和执行 CPU
+    // 这是函数的统一出口点，无论前面走了哪个中断处理分支
     
-    // 根据 drastic.cpp 第25459行：直接使用 param_1（不是 nds_system + param_1）
-    // 但如果 param_1 是偏移量，则应该是 nds_system + param_1 + 0x318
-    // 根据代码分析，param_1 在函数开始时作为偏移量使用（nds_system + param_1）
-    // 但在最后部分直接使用 param_1，可能是编译器的优化或者代码的bug
-    // 我们采用与 drastic.cpp 完全一致的方式
-    
-    // 根据 drastic.cpp 第25459行：**(int **)(param_1 + 0x318)
+    // 获取当前事件列表的时间增量
+    // param_1 + 0x318: 事件列表指针的地址
+    // **(int **)(param_1 + 0x318): 取事件列表第一个节点的时间值
     iVar3 = **(int **)(param_1 + 0x318);
-    // 根据 drastic.cpp 第25460行：*(int *)(nds_system + param_1 + 0x10cde60)
-    iVar7 = *(int *)(nds_system + param_1 + 0x10cde60);
-    // 根据 drastic.cpp 第25461行：*(int *)(nds_system + param_1 + 0x10cdfe0)
-    iVar4 = *(int *)(nds_system + param_1 + 0x10cdfe0);
-    // 根据 drastic.cpp 第25462行：*(int *)(param_1 + 0x10)
-    *(int *)(param_1 + 0x10) = iVar3;
-    // 根据 drastic.cpp 第25463行：*(int *)(nds_system + param_1 + 0x10cdfe0)
-    *(int *)(nds_system + param_1 + 0x10cdfe0) = iVar4 + iVar3;
     
-    // 根据 drastic.cpp 第25464-25469行
+    // ARM7 相关状态
+    iVar7 = *(int *)(nds_system + system_offset + 0x10cde60);  // ARM7 任务切换标志
+    iVar4 = *(int *)(nds_system + system_offset + 0x10cdfe0);  // ARM7 时间累加器
+    
+    // 更新剩余时间和时间累加器
+    *(int *)(param_1 + 0x10) = iVar3;  // 设置剩余时间
+    *(int *)(nds_system + system_offset + 0x10cdfe0) = iVar4 + iVar3;  // 累加时间
+    
+    // 检查是否需要任务切换
     if (iVar7 != 0) {
-        *(uint32_t *)(nds_system + param_1 + 0x10cdfe0) = 0xffffffff;
-        // 根据 drastic.cpp 第25468行：函数指针在 nds_system + param_1 + 0x10ce100
-        // 调用时传入 param_1（不是 nds_system + param_1）
+        // 需要任务切换：设置最大剩余时间，执行特殊处理函数
+        *(uint32_t *)(nds_system + system_offset + 0x10cdfe0) = 0xffffffff;
         typedef void (*cpu_func_t)(long);
-        cpu_func_t *func_ptr = (cpu_func_t *)(nds_system + param_1 + 0x10ce100);
+        cpu_func_t *func_ptr = (cpu_func_t *)(nds_system + system_offset + 0x10ce100);
         if (func_ptr && *func_ptr) {
-            (*func_ptr)(param_1);
+            (*func_ptr)(param_1);  // 传入系统状态结构地址
         }
         return;
     }
     
-    // 根据 drastic.cpp 第25471行：_execute_cpu(param_1 + 0x15c7d50)
-    // 注意：这里直接使用 param_1，不是 nds_system + param_1
+    // 正常执行 CPU：执行 ARM7 处理器
+    // 0x15c7d50 是 ARM7 CPU 执行器结构相对于系统状态结构的偏移
+    // param_1 + 0x15c7d50 = (nds_system + 0x320) + 0x15c7d50
+    //                     = nds_system + 0x15c8070 (ARM7 CPU 执行器)
     _execute_cpu(param_1 + 0x15c7d50);
     
-    // 根据 drastic.cpp 第25474行：函数指针在 nds_system + param_1 + 0x10ce100
-    // 参数是 *(undefined8 *)(nds_system + param_1 + 0x10cdfa8)
+    // 执行完 CPU 后的回调函数
+    // 这通常用于处理 DMA、定时器等需要在 CPU 执行后更新的子系统
     typedef void (*cpu_func2_t)(unsigned long);
-    cpu_func2_t *func2_ptr = (cpu_func2_t *)(nds_system + param_1 + 0x10ce100);
-    long *param2_ptr = (long *)(nds_system + param_1 + 0x10cdfa8);
+    cpu_func2_t *func2_ptr = (cpu_func2_t *)(nds_system + system_offset + 0x10ce100);
+    long *param2_ptr = (long *)(nds_system + system_offset + 0x10cdfa8);
     if (func2_ptr && *func2_ptr && param2_ptr) {
         (*func2_ptr)((unsigned long)*param2_ptr);
     }
