@@ -1,0 +1,1230 @@
+/*
+ * RetroArch core for DraStic DS Emulator
+ * Based on decompiled drastic.cpp
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <setjmp.h>
+#include <unistd.h>
+
+// POSIX headers (guarded for non-POSIX platforms)
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
+#include "libretro.h"
+#include "drastic.h"
+
+undefined1 nds_system[NDS_SYSTEM_SIZE];
+
+// 调试输出标志
+static int debug_enabled = 1;  // 可以通过环境变量控制
+
+// Global state
+static int initialized = 0;
+static int game_loaded = 0;
+static uint16_t *frame_buffer = NULL;
+static int frame_width = 256 * 2;  // Dual screen width (side by side)
+static int frame_height = 192;     // Single screen height
+static uint8_t *rom_data = NULL;
+static size_t rom_size = 0;
+static char *temp_rom_path = NULL;
+static int use_recompiler = 0;  // 0 = interpreter, 1 = recompiler
+
+// Libretro callbacks
+static retro_video_refresh_t video_cb;
+static retro_audio_sample_t audio_cb;
+static retro_audio_sample_batch_t audio_batch_cb;
+static retro_environment_t environ_cb;
+static retro_input_poll_t input_poll_cb;
+static retro_input_state_t input_state_cb;
+
+// Input state - DS按键映射
+// DS按键位: A=0, B=1, Select=2, Start=3, Right=4, Left=5, Up=6, Down=7, R=8, L=9
+static uint16_t ds_input_state = 0xFFFF;
+
+// 音频缓冲区（用于临时存储音频样本）
+#define AUDIO_BUFFER_SIZE 4096
+static int16_t audio_buffer[AUDIO_BUFFER_SIZE * 2];  // 立体声：左右声道  // 初始状态为所有按键未按下（低有效）
+
+// 环境设置标志，确保环境设置只执行一次
+static int environment_set = 0;
+
+// 硬件渲染回调结构（全局保存，供 RetroArch 访问）
+static struct retro_hw_render_callback hw_render_cb;
+
+// 硬件渲染回调函数：返回当前帧缓冲区地址
+// 这个函数用于满足 RetroArch 的硬件渲染回调要求
+// 即使我们使用软件渲染，RetroArch 也可能尝试调用这个函数
+static uintptr_t get_current_framebuffer_cb(void)
+{
+    // 返回当前帧缓冲区的地址（转换为 uintptr_t）
+    // 如果 frame_buffer 为 NULL，返回 0
+    return (uintptr_t)frame_buffer;
+}
+
+// 核心选项定义
+// 根据 libretro API，核心选项格式为 "key;Description|value1|value2|..."
+// 当前核心不使用任何选项，在 retro_init 中会设置一个空的变量数组
+// 如果将来需要核心选项，可以定义如下：
+// static struct retro_variable core_options[] = {
+//     { "drastic_cpu_mode", "CPU Mode; Interpreter|Recompiler" },
+//     { NULL, NULL }  // 数组必须以 NULL 结尾
+// };
+
+// 核心选项值存储（使用默认值）
+// static const char *cpu_mode_value = "Interpreter";
+
+// RetroArch API implementation
+// 所有 libretro API 函数必须使用 C 链接，以便 RetroArch 能够正确找到符号
+extern "C" {
+
+void retro_init(void)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Starting initialization...\n");
+    }
+    
+    if (initialized) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: Already initialized, returning\n");
+        }
+        return;
+    }
+    
+    // Allocate frame buffer for dual screen (side by side: 512x192)
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Allocating frame buffer (%dx%d)\n", frame_width, frame_height);
+    }
+    // 分配并初始化为0
+    //nds_system = (unsigned char*)malloc(NDS_SYSTEM_SIZE);
+    if (nds_system != NULL) {
+        memset(nds_system, 0, NDS_SYSTEM_SIZE);  // 初始化为0
+    } else {
+        // 处理内存分配失败
+        printf("[DRASTIC] retro_init: ERROR: Failed to allocate nds_system memory\n");
+    }
+    frame_buffer = (uint16_t*)calloc(frame_width * frame_height, sizeof(uint16_t));
+    if (!frame_buffer) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: Failed to allocate frame buffer\n");
+        }
+        return;
+    }
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Initializing system...\n");
+    }
+    // Initialize drastic system
+    int sys_result = initialize_system(nds_system);
+    if (sys_result < 0) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: initialize_system failed\n");
+        }
+        if (frame_buffer) {
+            free(frame_buffer);
+            frame_buffer = NULL;
+        }
+        return;
+    }
+    
+    // 加载 BIOS 文件
+    // 获取系统目录路径
+    const char *system_dir = NULL;
+    if (environ_cb) {
+        environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system_dir);
+    }
+    
+    // 如果没有系统目录，使用默认路径
+    if (!system_dir || strlen(system_dir) == 0) {
+        // 尝试使用常见的 RetroArch 系统目录
+        const char *home = getenv("HOME");
+        if (home) {
+            static char default_system_dir[512];
+            snprintf(default_system_dir, sizeof(default_system_dir), "%s/.config/retroarch", home);
+            system_dir = default_system_dir;
+        } else {
+            system_dir = ".";  // 当前目录
+        }
+    }
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: System directory: %s\n", system_dir);
+    }
+    
+    // 加载 BIOS（使用系统状态结构地址）
+    // 注意：BIOS 加载失败不应该阻止核心初始化
+    // 如果没有 BIOS，核心可能无法正常运行，但至少可以加载
+    extern int load_bios_files(long param_1, const char *system_dir);
+    int bios_result = load_bios_files((long)nds_system + 0x320, system_dir);
+    if (bios_result < 0) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: WARNING: BIOS files not found. Core will continue but may not work properly.\n");
+            fprintf(stderr, "[DRASTIC] retro_init: Please place BIOS files in: %s/system/\n", system_dir);
+            fprintf(stderr, "[DRASTIC] retro_init: Required files: nds_bios_arm9.bin (4KB), nds_bios_arm7.bin (16KB)\n");
+        }
+        // 不返回错误，允许核心继续初始化
+    }
+    
+    initialized = 1;
+    
+    // 使用默认设置
+    use_recompiler = 0;  // 默认使用解释器模式
+    
+    // 明确提供一个空的变量数组，告诉 RetroArch 这个核心没有选项
+    // 这样可以防止 RetroArch 尝试解析可能损坏的配置文件
+    // 必须在系统完全初始化后调用，此时 RetroArch 的核心选项管理器已经准备好
+    if (environ_cb) {
+        // 在调用 SET_VARIABLES 之前，先设置硬件渲染回调结构
+        // 这可以防止 RetroArch 在处理 SET_VARIABLES 时尝试设置空指针导致段错误
+        // 即使我们使用软件渲染，RetroArch 也可能尝试访问这个回调
+        // 注意：我们不调用 SET_HW_RENDER，因为我们使用软件渲染
+        // 但是，我们确保硬件渲染回调结构已初始化，以防 RetroArch 尝试访问它
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: Hardware render callback initialized (software rendering, get_current_framebuffer=%p)\n", 
+                    (void*)hw_render_cb.get_current_framebuffer);
+        }
+        
+        // 定义一个只包含终止符的空数组
+        static const struct retro_variable vars;
+        
+        // 设置空的变量数组，明确告诉 RetroArch 没有核心选项
+        // RetroArch 在处理 SET_VARIABLES 时可能会尝试设置 get_current_framebuffer
+        // 通过提供有效的函数指针，我们可以避免段错误
+        // 注意：如果 RetroArch 尝试用 video_driver_get_current_framebuffer 覆盖我们的函数指针，
+        // 而 video_driver_get_current_framebuffer 是 NULL，就会导致段错误
+        // 这是 RetroArch 的一个已知问题，我们需要确保 video_driver_get_current_framebuffer 不是 NULL
+        //bool vars_result = environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, &vars);
+        bool vars_result = true;
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: SET_VARIABLES called with empty array (result=%d)\n", vars_result);
+        }
+        
+        // 设置不支持无游戏模式
+        bool no_content = false;
+        //environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_content);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: SET_SUPPORT_NO_GAME called (no_content=false)\n");
+        }
+    }
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Core has no options, using default settings\n");
+        fprintf(stderr, "[DRASTIC] retro_init: Initialization complete\n");
+    }
+}
+
+void retro_deinit(void)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_deinit: Called (initialized=%d, game_loaded=%d)\n", initialized, game_loaded);
+    }
+    
+    if (!initialized) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_deinit: Not initialized, returning\n");
+        }
+        return;
+    }
+    
+    retro_unload_game();
+    
+    if (frame_buffer) {
+        free(frame_buffer);
+        frame_buffer = NULL;
+    }
+    
+    if (temp_rom_path) {
+        unlink(temp_rom_path);  // 删除临时文件
+        free(temp_rom_path);
+        temp_rom_path = NULL;
+    }
+    //free(nds_system);
+    initialized = 0;
+    game_loaded = 0;
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_deinit: Deinitialization complete\n");
+    }
+}
+
+unsigned retro_api_version(void)
+{
+    return RETRO_API_VERSION;
+}
+
+void retro_set_controller_port_device(unsigned port, unsigned device)
+{
+    // Handle controller device changes if needed
+}
+
+void retro_get_system_info(struct retro_system_info *info)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_system_info: Called\n");
+    }
+    
+    if (!info) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_get_system_info: ERROR: info is NULL!\n");
+        }
+        return;
+    }
+    
+    memset(info, 0, sizeof(*info));
+    info->library_name = "DraStic";
+    info->library_version = "r2.5.2.2";
+    info->valid_extensions = "nds|bin";
+    info->need_fullpath = false;
+    info->block_extract = false;
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_system_info: Returning name=%s, version=%s, extensions=%s, need_fullpath=%d\n",
+                info->library_name, info->library_version, info->valid_extensions, info->need_fullpath);
+    }
+}
+
+void retro_get_system_av_info(struct retro_system_av_info *info)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_system_av_info: Called (game_loaded=%d)\n", game_loaded);
+    }
+    
+    if (!info) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_get_system_av_info: ERROR: info is NULL!\n");
+        }
+        return;
+    }
+    
+    // 确保结构体被清零
+    memset(info, 0, sizeof(*info));
+    
+    float aspect = (float)frame_width / (float)frame_height;
+    
+    info->geometry.base_width = frame_width;
+    info->geometry.base_height = frame_height;
+    info->geometry.max_width = frame_width;
+    info->geometry.max_height = frame_height;
+    info->geometry.aspect_ratio = aspect;
+    
+    info->timing.fps = 60.0;
+    info->timing.sample_rate = 32768.0;
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_system_av_info: Returning geometry=%dx%d, aspect=%.3f, fps=%.2f, sample_rate=%.2f\n",
+                info->geometry.base_width, info->geometry.base_height, info->geometry.aspect_ratio,
+                info->timing.fps, info->timing.sample_rate);
+    }
+}
+
+void retro_set_environment(retro_environment_t cb)
+{
+    /*
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_environment: Called with cb=%p\n", (void*)cb);
+    }
+    
+    environ_cb = cb;
+    
+    if (!cb) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_set_environment: cb is NULL, returning\n");
+        }
+        return;
+    }
+    
+    // 初始化硬件渲染回调结构，确保所有字段都被正确初始化
+    // 虽然我们使用软件渲染，但 RetroArch 在处理某些环境命令时可能会尝试访问这个结构
+    // 通过完全初始化这个结构，我们可以避免段错误
+    memset(&hw_render_cb, 0, sizeof(hw_render_cb));
+    hw_render_cb.context_type = NULL;  // NULL 明确表示不使用硬件渲染（软件渲染）
+    hw_render_cb.get_current_framebuffer = get_current_framebuffer_cb;  // 提供有效的函数指针，防止 RetroArch 尝试设置 NULL 指针
+    // 其他回调函数指针保持为 NULL/0，因为我们不使用硬件渲染
+    // 注意：我们不调用 SET_HW_RENDER，因为我们使用软件渲染
+    // 根据 libretro API，核心应该只在需要硬件渲染时调用 SET_HW_RENDER
+    // 如果核心不调用 SET_HW_RENDER，RetroArch 会自动使用软件渲染
+    
+    // 注意：不要在 retro_set_environment 中立即调用 SET_VARIABLES
+    // 这会导致 RetroArch 的核心选项管理器在未完全初始化时被调用，导致 SIGSEGV
+    // SET_VARIABLES 将在 retro_init 中延迟调用，此时系统已完全初始化
+    // 在 retro_init 中会设置一个空的变量数组，明确告诉 RetroArch 这个核心没有选项
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_environment: Environment callback registered (using software rendering, SET_VARIABLES will be called in retro_init)\n");
+    }
+        */
+}
+
+void retro_set_video_refresh(retro_video_refresh_t cb)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_video_refresh: Called with cb=%p\n", (void*)cb);
+    }
+    video_cb = cb;
+}
+
+void retro_set_audio_sample(retro_audio_sample_t cb)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_audio_sample: Called with cb=%p\n", (void*)cb);
+    }
+    audio_cb = cb;
+}
+
+void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_audio_sample_batch: Called with cb=%p\n", (void*)cb);
+    }
+    audio_batch_cb = cb;
+}
+
+void retro_set_input_poll(retro_input_poll_t cb)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_input_poll: Called with cb=%p\n", (void*)cb);
+    }
+    input_poll_cb = cb;
+}
+
+void retro_set_input_state(retro_input_state_t cb)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_set_input_state: Called with cb=%p\n", (void*)cb);
+    }
+    input_state_cb = cb;
+}
+
+void retro_reset(void)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_reset: Called (initialized=%d, game_loaded=%d)\n", initialized, game_loaded);
+    }
+    if (initialized) {
+        reset_system((long)nds_system);
+    }
+}
+
+int retro_load_game(const struct retro_game_info *info)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: Called with info=%p\n", (void*)info);
+        if (info) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: info->path=%s, info->data=%p, info->size=%zu\n",
+                    info->path ? info->path : "(null)", (void*)info->data, info->size);
+        }
+    }
+    
+    if (!info || !info->data) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: ERROR: Invalid parameters, returning 0\n");
+        }
+        return 0;
+    }
+    
+    // Initialize system if not already done
+    if (!initialized) {
+        retro_init();
+        if (!initialized) {
+            return 0;
+        }
+    }
+    
+    // Unload previous game if any
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: Unloading previous game if any (game_loaded=%d)\n", game_loaded);
+    }
+    //retro_unload_game();
+    
+    // 注意：不在这里调用环境回调
+    // RetroArch 在处理环境回调时可能会查询核心选项，导致段错误
+    // 环境设置将在 retro_run 中进行，此时系统已完全初始化且游戏已加载
+    
+    rom_size = info->size;
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: ROM size: %zu bytes (%.2f MB)\n",
+                rom_size, rom_size / (1024.0 * 1024.0));
+    }
+    
+    rom_data = (uint8_t*)malloc(rom_size);
+    if (!rom_data) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] ERROR: Failed to allocate ROM data buffer\n");
+        }
+        return 0;
+    }
+    
+    memcpy(rom_data, info->data, rom_size);
+    
+    // 检查 ROM 文件头（NDS 文件头验证）
+    if (debug_enabled && rom_size >= 512) {
+        // NDS 文件头在偏移 0x00-0x0F 处有游戏标题
+        // 偏移 0x0C 处有游戏代码（4字节）
+        // 偏移 0x68 处有 ARM9 程序入口点
+        // 偏移 0x6C 处有 ARM9 ROM 地址
+        // 偏移 0x70 处有 ARM9 程序大小
+        // 偏移 0x78 处有 ARM7 ROM 地址
+        // 偏移 0x7C 处有 ARM7 程序大小
+        uint32_t *rom_header = (uint32_t*)rom_data;
+        char game_title[13] = {0};
+        memcpy(game_title, rom_data, 12);
+        uint32_t game_code = rom_header[3];  // 偏移 0x0C
+        uint32_t arm9_entry = rom_header[26];  // 偏移 0x68
+        uint32_t arm9_rom_addr = rom_header[27];  // 偏移 0x6C
+        uint32_t arm9_size = rom_header[28];  // 偏移 0x70
+        uint32_t arm7_entry = rom_header[29];  // 偏移 0x74 (ARM7 入口点)
+        uint32_t arm7_rom_addr = rom_header[30];  // 偏移 0x78
+        uint32_t arm7_size = rom_header[31];  // 偏移 0x7C
+        
+        fprintf(stderr, "[DRASTIC] ROM Header Info:\n");
+        fprintf(stderr, "  Game Title: %.12s\n", game_title);
+        fprintf(stderr, "  Game Code: 0x%08x\n", game_code);
+        fprintf(stderr, "  ARM9 Entry: 0x%08x, ROM Addr: 0x%08x, Size: 0x%08x (%u bytes)\n",
+                arm9_entry, arm9_rom_addr, arm9_size, arm9_size);
+        fprintf(stderr, "  ARM7 Entry: 0x%08x, ROM Addr: 0x%08x, Size: 0x%08x (%u bytes)\n",
+                arm7_entry, arm7_rom_addr, arm7_size, arm7_size);
+        
+        // 检查 ARM7 大小是否为 0
+        // 注意：某些 NDS ROM 可能确实有 ARM7 大小为 0 的情况
+        // 但通常 ARM7 程序是必需的，因为它负责系统功能（如音频、WiFi 等）
+        if (arm7_size == 0) {
+            fprintf(stderr, "[DRASTIC] WARNING: ARM7 program size is 0!\n");
+            fprintf(stderr, "[DRASTIC] NOTE: This ROM may be incomplete or corrupted.\n");
+            fprintf(stderr, "[DRASTIC] NOTE: DraStic requires BIOS files (nds_bios_arm9.bin, nds_bios_arm7.bin) for proper emulation.\n");
+            fprintf(stderr, "[DRASTIC] NOTE: However, ARM7 size 0 is unusual and may indicate a ROM format issue.\n");
+        }
+        
+        // 检查 ARM9 ROM 地址是否合理
+        // 正常的 NDS ROM 中，ARM9 和 ARM7 程序通常在 ROM 文件的开头部分
+        // ARM9 ROM 地址通常是一个相对较小的值（在 ROM 文件内）
+        if (arm9_rom_addr > 0x10000000) {
+            fprintf(stderr, "[DRASTIC] WARNING: ARM9 ROM address (0x%08x) seems unusually high\n",
+                    arm9_rom_addr);
+            fprintf(stderr, "[DRASTIC] NOTE: This might indicate the ROM address is an absolute address rather than file offset.\n");
+        }
+        
+        // 检查 ARM7 ROM 地址
+        if (arm7_rom_addr > 0x10000000 && arm7_size > 0) {
+            fprintf(stderr, "[DRASTIC] WARNING: ARM7 ROM address (0x%08x) seems unusually high\n",
+                    arm7_rom_addr);
+        }
+        fprintf(stderr, "  First 16 bytes: ");
+        for (int i = 0; i < 16; i++) {
+            fprintf(stderr, "%02x ", rom_data[i]);
+        }
+        fprintf(stderr, "\n");
+    }
+    
+    // load_nds 需要文件路径，所以我们需要创建一个临时文件
+    // 使用 info->path 如果可用，否则创建临时文件
+    const char *rom_path = NULL;
+    
+    if (info->path && strlen(info->path) > 0) {
+        rom_path = info->path;
+    } else {
+        // 创建临时文件路径（跨平台简单实现）
+        char tmpname[L_tmpnam];
+        if (tmpnam(tmpname) == NULL) {
+            free(rom_data);
+            rom_data = NULL;
+            return 0;
+        }
+        temp_rom_path = (char*)malloc(strlen(tmpname) + 1);
+        if (!temp_rom_path) {
+            free(rom_data);
+            rom_data = NULL;
+            return 0;
+        }
+        strcpy(temp_rom_path, tmpname);
+
+        // 写入 ROM 数据到临时文件
+        FILE *fp = fopen(temp_rom_path, "wb");
+        if (!fp) {
+            free(temp_rom_path);
+            temp_rom_path = NULL;
+            free(rom_data);
+            rom_data = NULL;
+            return 0;
+        }
+
+        size_t written = fwrite(rom_data, 1, rom_size, fp);
+        fclose(fp);
+
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] Wrote ROM to temp file: %s (%zu bytes)\n",
+                    temp_rom_path, written);
+        }
+
+        if (written != rom_size) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] ERROR: Failed to write ROM to temp file: wrote %zu/%zu bytes\n",
+                        written, rom_size);
+            }
+            unlink(temp_rom_path);
+            free(temp_rom_path);
+            temp_rom_path = NULL;
+            free(rom_data);
+            rom_data = NULL;
+            return 0;
+        }
+
+        rom_path = temp_rom_path;
+    }
+    
+    if (debug_enabled && info->path && strlen(info->path) > 0) {
+        fprintf(stderr, "[DRASTIC] Using ROM file path: %s\n", rom_path);
+    }
+    
+    // 初始化屏幕（如果需要）
+    initialize_screen((long)nds_system);
+    set_screen_menu_off();
+    
+    // 加载 NDS 文件
+    // 根据 drastic.cpp main 函数，load_nds 的第一个参数是 nds_system + 0x320 (800 in decimal)
+    // 但实际应该传递 nds_system 的偏移，这里使用 0x320
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: calling load_nds with path=%s\n", rom_path);
+    }
+    int result = load_nds((long)nds_system + 0x320, (char *)rom_path);
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: load_nds returned: %d\n", result);
+    }
+    
+    if (result != 0) {
+        // 加载失败
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] ERROR: load_nds failed with result=%d\n", result);
+        }
+        if (temp_rom_path) {
+            unlink(temp_rom_path);
+            free(temp_rom_path);
+            temp_rom_path = NULL;
+        }
+        free(rom_data);
+        rom_data = NULL;
+        return 0;
+    }
+    
+    // 重置系统以开始游戏
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: calling reset_system\n");
+    }
+    reset_system((long)nds_system);
+    
+    game_loaded = 1;
+    ds_input_state = 0xFFFF;  // 重置输入状态
+    
+    // 注意：不要在 retro_load_game 中调用大多数环境回调
+    // RetroArch 在处理环境回调时可能会查询核心选项，导致段错误
+    // 但是 SET_SYSTEM_AV_INFO 是安全的，必须在游戏加载后立即调用
+    // 这样 RetroArch 才能知道游戏已加载并正确初始化显示
+    if (environ_cb && game_loaded) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: Setting SYSTEM_AV_INFO (safe to call here)\n");
+        }
+        
+        // 通知 RetroArch 系统 AV 信息（这是安全的，不会触发核心选项查询）
+        struct retro_system_av_info av_info;
+        memset(&av_info, 0, sizeof(av_info));  // 确保结构体被清零
+        retro_get_system_av_info(&av_info);
+        
+        // 保存调用前的值用于调试（因为 RetroArch 可能会修改结构体）
+        unsigned int before_width = av_info.geometry.base_width;
+        unsigned int before_height = av_info.geometry.base_height;
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: Before SET_SYSTEM_AV_INFO: geometry=%ux%u, aspect=%.3f, fps=%.2f, sample_rate=%.2f\n",
+                    before_width, before_height, av_info.geometry.aspect_ratio,
+                    av_info.timing.fps, av_info.timing.sample_rate);
+        }
+        
+        int result = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: SET_SYSTEM_AV_INFO result=%d\n", result);
+            fprintf(stderr, "[DRASTIC] retro_load_game: Note: av_info may be modified by RetroArch after call\n");
+        }
+        
+        // 注意：不在 retro_load_game 中调用 SET_SUPPORT_NO_GAME
+        // 即使是在 SET_SYSTEM_AV_INFO 之后调用，仍然会触发核心选项管理器查询，导致 SIGSEGV
+        // SET_SUPPORT_NO_GAME 将在 retro_run 的第一次调用时设置
+        // 虽然这可能导致 RetroArch 暂时认为核心支持无游戏模式，但一旦 retro_run 被调用，就会正确设置
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: SET_SUPPORT_NO_GAME and SET_PIXEL_FORMAT will be set in retro_run to avoid SIGSEGV\n");
+        }
+    }
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: game loaded successfully\n");
+        fprintf(stderr, "[DRASTIC] retro_load_game: game_loaded flag set to %d\n", game_loaded);
+        fprintf(stderr, "[DRASTIC] retro_load_game: initialized=%d, game_loaded=%d\n", initialized, game_loaded);
+        fprintf(stderr, "[DRASTIC] retro_load_game: Returning 1 (success)\n");
+    }
+    
+    // 确保返回 1 表示成功
+    return 1;
+}
+
+void retro_unload_game(void)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_unload_game: Called (game_loaded=%d)\n", game_loaded);
+    }
+    
+    if (rom_data) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_unload_game: Freeing ROM data (%zu bytes)\n", rom_size);
+        }
+        free(rom_data);
+        rom_data = NULL;
+        rom_size = 0;
+    }
+    
+    if (temp_rom_path) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_unload_game: Removing temp file: %s\n", temp_rom_path);
+        }
+        unlink(temp_rom_path);
+        free(temp_rom_path);
+        temp_rom_path = NULL;
+    }
+    
+    game_loaded = 0;
+    environment_set = 0;  // 重置环境设置标志，以便下次加载游戏时重新设置
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_unload_game: Game unloaded (game_loaded=%d)\n", game_loaded);
+    }
+}
+
+unsigned retro_get_region(void)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_region: Called (game_loaded=%d), returning RETRO_REGION_NTSC\n", game_loaded);
+    }
+    return RETRO_REGION_NTSC; // DS is region-free but NTSC timing
+}
+
+void *retro_get_memory_data(unsigned id)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_memory_data: Called with id=%u (game_loaded=%d)\n", id, game_loaded);
+    }
+    
+    // Return memory regions if needed
+    switch (id) {
+        case RETRO_MEMORY_SAVE_RAM:
+            // NDS 保存 RAM (SRAM) - 通常存储在 nds_system 的特定区域
+            // 如果没有游戏加载，返回 NULL 是正常的
+            if (!game_loaded) {
+                if (debug_enabled) {
+                    fprintf(stderr, "[DRASTIC] retro_get_memory_data: SAVE_RAM requested but no game loaded, returning NULL\n");
+                }
+                return NULL;
+            }
+            // TODO: 返回实际的保存 RAM 地址
+            // 目前返回 NULL 表示没有保存 RAM（某些游戏可能不需要）
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_data: SAVE_RAM requested, returning NULL (not implemented yet)\n");
+            }
+            return NULL;
+        case RETRO_MEMORY_RTC:
+            // NDS 实时时钟 (RTC) - 通常不需要
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_data: RTC requested, returning NULL (not needed for NDS)\n");
+            }
+            return NULL;
+        case RETRO_MEMORY_SYSTEM_RAM:
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_data: Returning SYSTEM_RAM pointer=%p\n", (void*)nds_system);
+            }
+            return nds_system;
+        default:
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_data: Unknown id=%u, returning NULL\n", id);
+            }
+            return NULL;
+    }
+}
+
+size_t retro_get_memory_size(unsigned id)
+{
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_get_memory_size: Called with id=%u (game_loaded=%d)\n", id, game_loaded);
+    }
+    
+    switch (id) {
+        case RETRO_MEMORY_SAVE_RAM:
+            // NDS 保存 RAM 大小 - 通常是 512KB 或更小
+            // 如果没有游戏加载，返回 0 是正常的
+            if (!game_loaded) {
+                if (debug_enabled) {
+                    fprintf(stderr, "[DRASTIC] retro_get_memory_size: SAVE_RAM requested but no game loaded, returning 0\n");
+                }
+                return 0;
+            }
+            // TODO: 返回实际的保存 RAM 大小
+            // 目前返回 0 表示没有保存 RAM
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_size: SAVE_RAM requested, returning 0 (not implemented yet)\n");
+            }
+            return 0;
+        case RETRO_MEMORY_RTC:
+            // NDS 实时时钟大小 - 通常不需要
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_size: RTC requested, returning 0 (not needed for NDS)\n");
+            }
+            return 0;
+        case RETRO_MEMORY_SYSTEM_RAM:
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_size: Returning SYSTEM_RAM size=62042112\n");
+            }
+            return 62042112;
+        default:
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_get_memory_size: Unknown id=%u, returning 0\n", id);
+            }
+            return 0;
+    }
+}
+
+// 将 RetroArch 输入映射到 DS 按键
+static void update_ds_input(void)
+{
+    if (!input_state_cb) {
+        return;
+    }
+    
+    // DS 按键寄存器格式（低有效，即 0=按下，1=未按下）
+    // Bit 0: A
+    // Bit 1: B
+    // Bit 2: Select
+    // Bit 3: Start
+    // Bit 4: Right
+    // Bit 5: Left
+    // Bit 6: Up
+    // Bit 7: Down
+    // Bit 8: R
+    // Bit 9: L
+    // Bit 10-15: 未使用
+    
+    uint16_t input = 0xFFFF;  // 初始状态：所有按键未按下
+    
+    // 读取 RetroArch 输入并映射到 DS 按键
+    // 使用端口 0
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A)) {
+        input &= ~(1 << 0);  // A
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B)) {
+        input &= ~(1 << 1);  // B
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT)) {
+        input &= ~(1 << 2);  // Select
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START)) {
+        input &= ~(1 << 3);  // Start
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT)) {
+        input &= ~(1 << 4);  // Right
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT)) {
+        input &= ~(1 << 5);  // Left
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP)) {
+        input &= ~(1 << 6);  // Up
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN)) {
+        input &= ~(1 << 7);  // Down
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R)) {
+        input &= ~(1 << 8);  // R
+    }
+    if (input_state_cb(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L)) {
+        input &= ~(1 << 9);  // L
+    }
+    
+    ds_input_state = input;
+    
+    // 更新 drastic 的输入状态
+    // 使用辅助函数设置输入状态
+    drastic_set_input_state(input);
+    
+    // 调用 update_input 以更新输入系统
+    // update_input 的参数是 nds_system + 0xAAA (2730 in decimal)
+    long input_offset = (long)nds_system + 0xAAA;
+    update_input(input_offset);
+}
+
+// 保存状态支持（可选但推荐实现）
+size_t retro_serialize_size(void)
+{
+    // 返回保存状态所需的大小
+    // 对于 NDS 模拟器，需要保存整个系统状态
+    // 这里返回 nds_system 的大小加上一些额外的元数据
+    return sizeof(nds_system) + 1024;  // 额外空间用于元数据
+}
+
+bool retro_serialize(void *data, size_t size)
+{
+    if (!initialized || !game_loaded || !data) {
+        return false;
+    }
+    
+    // 检查缓冲区大小
+    if (size < sizeof(nds_system)) {
+        return false;
+    }
+    
+    // 简单实现：直接复制整个系统状态
+    // 实际实现可能需要更复杂的序列化逻辑
+    memcpy(data, nds_system, sizeof(nds_system));
+    
+    return true;
+}
+
+bool retro_unserialize(const void *data, size_t size)
+{
+    if (!initialized || !game_loaded || !data) {
+        return false;
+    }
+    
+    // 检查数据大小
+    if (size < sizeof(nds_system)) {
+        return false;
+    }
+    
+    // 简单实现：直接恢复整个系统状态
+    // 实际实现可能需要更复杂的反序列化逻辑
+    memcpy(nds_system, data, sizeof(nds_system));
+    
+    return true;
+}
+
+// 作弊系统支持（可选但推荐实现）
+void retro_cheat_reset(void)
+{
+    // 重置所有作弊码
+    // 对于 NDS 模拟器，这里可以清除所有已应用的作弊码
+    // 当前实现为空，因为还没有实现作弊系统
+}
+
+void retro_cheat_set(unsigned index, bool enabled, const char *code)
+{
+    // 设置作弊码
+    // index: 作弊码索引
+    // enabled: 是否启用
+    // code: 作弊码字符串
+    // 当前实现为空，因为还没有实现作弊系统
+    (void)index;
+    (void)enabled;
+    (void)code;
+}
+
+// 加载特殊类型游戏（可选函数）
+// 用于加载光盘、子系统等特殊类型的游戏
+// NDS 模拟器通常不需要这个功能，但 RetroArch 可能会查找这个符号
+bool retro_load_game_special(unsigned game_type, const struct retro_game_info *info, size_t num_info)
+{
+    // NDS 模拟器不支持特殊游戏类型，直接调用普通的加载函数
+    (void)game_type;
+    (void)num_info;
+    
+    if (!info) {
+        return false;
+    }
+    
+    // 对于 NDS，特殊加载和普通加载是一样的
+    return retro_load_game(info) != 0;
+}
+
+void retro_run(void)
+{
+
+    // 立即输出调试信息，确保即使函数立即返回也能看到
+    // 这必须在函数的最开始，在任何条件检查之前
+    static int frame_count = 0;
+    static int first_frame = 1;
+    static int call_count = 0;
+    
+    call_count++;
+    
+    // 总是输出前几次调用的调试信息，以便诊断问题
+    // 使用 fflush 确保输出立即刷新
+    // 这必须在任何 return 语句之前执行
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_run: ENTRY #%d - initialized=%d, game_loaded=%d, frame_count=%d\n", 
+                call_count, initialized, game_loaded, frame_count);
+        fflush(stderr);
+        
+        if (first_frame) {
+            first_frame = 0;
+        }
+    }
+    
+    // 即使游戏未加载，也输出前几次调用的调试信息
+    if (!initialized || !game_loaded) {
+        if (debug_enabled && call_count <= 10) {
+            fprintf(stderr, "[DRASTIC] retro_run: Skipping execution (call_count=%d, initialized=%d, game_loaded=%d, frame=%d)\n", 
+                    call_count, initialized, game_loaded, frame_count);
+        }
+        return;
+    }
+    
+    frame_count++;
+    
+    if (debug_enabled && frame_count == 1) {
+        fprintf(stderr, "[DRASTIC] retro_run: First frame execution (call_count=%d, initialized=%d, game_loaded=%d)\n", 
+                call_count, initialized, game_loaded);
+    }
+    
+    // 在第一次运行时设置环境变量（延迟设置，避免在加载游戏时崩溃）
+    // 这必须在游戏加载后且 retro_run 被调用时进行
+    // 此时 RetroArch 的核心选项管理器已经完全初始化，可以安全地调用环境回调
+    if (!environment_set && environ_cb && game_loaded) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: Setting environment variables (first frame, game_loaded=%d)\n", game_loaded);
+        }
+        
+        // Set pixel format to RGB565
+        unsigned pixel_format = RETRO_PIXEL_FORMAT_RGB565;
+        environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel_format);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: SET_PIXEL_FORMAT called (RGB565)\n");
+        }
+        
+        // Set support no game to false (core requires a game to run)
+        // 注意：false 表示核心不支持无游戏模式，必须加载游戏
+        // 这必须在 retro_run 中设置，因为在 retro_load_game 中设置会触发 SIGSEGV
+        // 虽然这会导致 RetroArch 暂时认为核心支持无游戏模式，但一旦 retro_run 被调用，就会正确设置
+        bool no_content = false;
+        environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_content);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: SET_SUPPORT_NO_GAME called (no_content=false)\n");
+        }
+        
+        // 通知 RetroArch 系统 AV 信息（再次设置，确保 RetroArch 知道游戏已加载）
+        struct retro_system_av_info av_info;
+        retro_get_system_av_info(&av_info);
+        environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: Environment variables set (no_content=false, av_info updated)\n");
+        }
+        
+        environment_set = 1;
+    }
+    
+    // Poll input
+    if (input_poll_cb) {
+        input_poll_cb();
+    }
+    
+    // 更新 DS 输入状态
+    update_ds_input();
+    
+    // 运行一帧模拟
+    // 根据 drastic.cpp 的 main 函数：
+    // - 使用 _setjmp 进行异常处理
+    // - 根据 nds_system[0x3b2a9a8] 判断使用解释器还是重编译器
+    // - 解释器模式：cpu_next_action_arm7_to_event_update(nds_system)
+    // - 重编译器模式：recompiler_entry(nds_system, nds_system._57482784_8_)
+    
+    // 这里我们需要运行到下一帧
+    // 由于 drastic 使用事件驱动模式，我们需要执行事件直到一帧完成
+    // 通常这涉及执行到下一个 VSync 事件
+    
+    // 简化的实现：直接调用模拟器的主循环函数
+    // 实际实现可能需要更复杂的逻辑来确保只运行一帧
+    // 根据 drastic.cpp，检查是否使用重编译器模式
+    if (nds_system[0x3b2a9a8] == '\0') {
+        // 解释器模式
+        cpu_next_action_arm7_to_event_update(nds_system);
+    } else {
+        // 重编译器模式
+        // 从 nds_system 的偏移 0x57482784 获取 translate_cache
+        undefined8 translate_cache = *(undefined8 *)(nds_system + 0x57482784);
+        recompiler_entry(nds_system, translate_cache);
+    }
+    
+    // 更新屏幕（渲染）
+    // 注意：update_screens() 在 libretro 中可能是空函数
+    // 实际的屏幕数据应该由 NDS GPU 在运行过程中更新
+    update_screens();
+    
+    // 获取视频缓冲区并发送到 RetroArch
+    // 使用 screen_copy16 来复制两个屏幕的数据
+    // 上屏（screen 0）和下屏（screen 1）并排放置
+    // 注意：即使屏幕是黑色的，也要发送，这样 RetroArch 才能显示窗口
+    if (debug_enabled && frame_count <= 5) {
+        fprintf(stderr, "[DRASTIC] retro_run frame %d: video_cb=%p, frame_buffer=%p\n", 
+                frame_count, (void*)video_cb, (void*)frame_buffer);
+    }
+    
+    if (video_cb) {
+        if (!frame_buffer) {
+            // 如果 frame_buffer 未分配，重新分配
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] Allocating frame_buffer: %dx%d\n", frame_width, frame_height);
+            }
+            frame_buffer = (uint16_t*)calloc(frame_width * frame_height, sizeof(uint16_t));
+            if (!frame_buffer) {
+                if (debug_enabled) {
+                    fprintf(stderr, "[DRASTIC] ERROR: Failed to allocate frame_buffer\n");
+                }
+                return;  // 无法分配内存
+            }
+        }
+        // 准备临时缓冲区用于复制屏幕数据
+        // screen_copy16 会将屏幕数据复制到提供的缓冲区
+        // 每个屏幕是 256x192 = 49152 像素（对于16位，即 256*192 = 49152 个 uint16_t）
+        uint16_t screen0_buffer[256 * 192];
+        uint16_t screen1_buffer[256 * 192];
+        
+        // 复制上屏（screen 0）
+        void *screen0_ptr = get_screen_ptr(0);
+        if (debug_enabled && frame_count <= 5) {
+            fprintf(stderr, "[DRASTIC] Screen 0 ptr: %p\n", screen0_ptr);
+        }
+        screen_copy16(screen0_buffer, 0);
+        
+        // 复制下屏（screen 1）
+        void *screen1_ptr = get_screen_ptr(1);
+        if (debug_enabled && frame_count <= 5) {
+            fprintf(stderr, "[DRASTIC] Screen 1 ptr: %p\n", screen1_ptr);
+        }
+        screen_copy16(screen1_buffer, 1);
+        
+        // 检查屏幕缓冲区内容（前几个像素）
+        if (debug_enabled && frame_count <= 3) {
+            fprintf(stderr, "[DRASTIC] Screen 0 first 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    screen0_buffer[0], screen0_buffer[1], screen0_buffer[2], screen0_buffer[3]);
+            fprintf(stderr, "[DRASTIC] Screen 1 first 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    screen1_buffer[0], screen1_buffer[1], screen1_buffer[2], screen1_buffer[3]);
+            
+            // 检查屏幕缓冲区是否在 nds_system 范围内
+            unsigned long screen0_addr = (unsigned long)screen0_ptr;
+            unsigned long screen1_addr = (unsigned long)screen1_ptr;
+            unsigned long nds_system_addr = (unsigned long)nds_system;
+            unsigned long nds_system_end = nds_system_addr + 62042112;
+            
+            fprintf(stderr, "[DRASTIC] Screen 0 addr: %p, nds_system: %p-%p, offset: 0x%lx\n",
+                    screen0_ptr, (void*)nds_system_addr, (void*)nds_system_end,
+                    screen0_addr - nds_system_addr);
+            fprintf(stderr, "[DRASTIC] Screen 1 addr: %p, offset: 0x%lx\n",
+                    screen1_ptr, screen1_addr - nds_system_addr);
+            
+            // 检查屏幕缓冲区中间和末尾的像素
+            fprintf(stderr, "[DRASTIC] Screen 0 middle pixels (idx 16384-16387): 0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    screen0_buffer[16384], screen0_buffer[16385], screen0_buffer[16386], screen0_buffer[16387]);
+            fprintf(stderr, "[DRASTIC] Screen 0 last 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    screen0_buffer[49148], screen0_buffer[49149], screen0_buffer[49150], screen0_buffer[49151]);
+        }
+        
+        // 每 60 帧检查一次屏幕数据（1秒）
+        if (debug_enabled && frame_count % 60 == 0) {
+            // 统计非零像素数量
+            int non_zero0 = 0, non_zero1 = 0;
+            for (int i = 0; i < 256 * 192; i++) {
+                if (screen0_buffer[i] != 0) non_zero0++;
+                if (screen1_buffer[i] != 0) non_zero1++;
+            }
+            fprintf(stderr, "[DRASTIC] Frame %d: Screen 0 non-zero pixels: %d/%d, Screen 1: %d/%d\n",
+                    frame_count, non_zero0, 256*192, non_zero1, 256*192);
+        }
+        
+        // 将两个屏幕并排放置到 frame_buffer
+        // 左侧是上屏，右侧是下屏
+        for (int y = 0; y < 192; y++) {
+            // 复制上屏的一行（左侧）
+            memcpy(frame_buffer + y * frame_width, 
+                   screen0_buffer + y * 256, 
+                   256 * sizeof(uint16_t));
+            
+            // 复制下屏的一行（右侧）
+            memcpy(frame_buffer + y * frame_width + 256, 
+                   screen1_buffer + y * 256, 
+                   256 * sizeof(uint16_t));
+        }
+        
+        // 发送到 RetroArch
+        // 注意：即使屏幕是黑色的，也要发送，这样 RetroArch 才能显示窗口
+        if (debug_enabled && frame_count <= 5) {
+            fprintf(stderr, "[DRASTIC] Calling video_cb: width=%d, height=%d, pitch=%zu\n",
+                    frame_width, frame_height, frame_width * sizeof(uint16_t));
+        }
+        video_cb(frame_buffer, frame_width, frame_height, frame_width * sizeof(uint16_t));
+        
+        if (debug_enabled && frame_count == 5) {
+            fprintf(stderr, "[DRASTIC] First 5 frames processed, reducing debug output\n");
+        }
+    } else {
+        if (debug_enabled && frame_count <= 5) {
+            fprintf(stderr, "[DRASTIC] WARNING: video_cb not set! video_cb=%p\n", (void*)video_cb);
+        }
+    }
+    
+    // 处理音频
+    // 从 SPU 获取音频样本
+    // SPU 位于 nds_system + 0x1587000 (根据 initialize_spu 的偏移)
+    if (audio_batch_cb) {
+        long spu_offset = (long)nds_system + 0x1587000;
+
+        // 渲染音频样本（32768Hz，每帧约546个样本）
+        int samples_per_frame = (int)(32768.0 / 60.0 + 0.5); // ~546
+
+        // 临时累加器数组（每个样本为一个 64-bit 累加对：低32位/高32位）
+        // 使用堆分配以避免过大的栈消耗
+        uint64_t *accum = (uint64_t*)calloc(samples_per_frame, sizeof(uint64_t));
+        if (!accum) return;
+
+        // 先更新所有通道设置，避免在渲染过程中出现需要在循环内部更新并导致死循环的情况
+        spu_update_all_channel_settings(spu_offset);
+
+        // 调用 SPU 渲染，将混音结果写入 accum（每元素为两个32位累加值）
+        spu_render_samples(spu_offset, (undefined8*)accum, samples_per_frame);
+        // 处理 capture（麦克风），与 drastic.cpp 的流程一致（channel 0/1）
+        //spu_render_capture(spu_offset, (undefined8)accum, samples_per_frame, 0);
+        //spu_render_capture(spu_offset, (undefined8)accum, samples_per_frame, 1);
+
+        // 将累加值转换为 int16_t 输出（右移 12 来匹配 drastic 的 >>0xc 缩放）
+        for (int i = 0; i < samples_per_frame; i++) {
+            int32_t low = (int32_t)(accum[i] & 0xFFFFFFFFUL);
+            int32_t high = (int32_t)((accum[i] >> 32) & 0xFFFFFFFFUL);
+
+            int32_t l = low >> 12;
+            int32_t r = high >> 12;
+            if (l < -32768) l = -32768;
+            if (l > 32767) l = 32767;
+            if (r < -32768) r = -32768;
+            if (r > 32767) r = 32767;
+
+            audio_buffer[i * 2 + 0] = (int16_t)l;
+            audio_buffer[i * 2 + 1] = (int16_t)r;
+        }
+
+        // 发送到 RetroArch（帧数为 samples_per_frame）
+        audio_batch_cb(audio_buffer, samples_per_frame);
+
+        free(accum);
+    }
+}
+
+} // extern "C" - 结束所有 libretro API 函数的 C 链接块
+

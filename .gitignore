@@ -1,0 +1,7 @@
+# 忽略所有 .o 目标文件
+*.o
+
+# 忽略 drastic.cpp 文件
+drastic.cpp
+src/drastic.cpp
+
