@@ -1136,6 +1136,20 @@ void retro_run(void)
             fprintf(stderr, "[DRASTIC] Screen 0 last 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
                     screen0_buffer[49148], screen0_buffer[49149], screen0_buffer[49150], screen0_buffer[49151]);
         }
+
+        // 立即检测是否两个屏幕均全黑（前几帧），以便快速发现渲染问题
+        if (debug_enabled && frame_count <= 5) {
+            int all_zero0 = 1, all_zero1 = 1;
+            for (int i = 0; i < 256 * 192; i++) {
+                if (screen0_buffer[i] != 0) { all_zero0 = 0; break; }
+            }
+            for (int i = 0; i < 256 * 192; i++) {
+                if (screen1_buffer[i] != 0) { all_zero1 = 0; break; }
+            }
+            if (all_zero0 && all_zero1) {
+                fprintf(stderr, "[DRASTIC] retro_run: WARNING: both screens appear all black on frame %d\n", frame_count);
+            }
+        }
         
         // 每 60 帧检查一次屏幕数据（1秒）
         if (debug_enabled && frame_count % 60 == 0) {

@@ -25,12 +25,24 @@
  // 全局系统内存（62042112 字节）
  extern undefined1 nds_system[NDS_SYSTEM_SIZE];
  
+// 调试输出标志
+extern int debug_enabled;  // 可以通过环境变量控制
+
 // 系统初始化和管理函数
 extern int initialize_system(long param_1);
 extern int load_nds(long param_1, const char *param_2);
 extern void reset_system(long param_1);
 extern void process_arguments(long param_1, int argc, long argv);
 extern void initialize_event_list(long param_1, long param_2);
+// Event / DMA helpers (from drastic.cpp)
+extern void initialize_event(long param_1, unsigned int param_2, void *param_3, long param_4);
+extern void initialize_dma(long param_1, long param_2, long param_3, long param_4, long param_5);
+// DMA event handler (defined in drastic.cpp)
+extern void event_dma_complete_function(long param_1, long param_2);
+// 初始化子系统
+extern void initialize_memory(long param_1);
+extern void initialize_cpu(long param_1);
+extern void initialize_gamecard(long param_1);
 extern int load_system_file(const char *system_dir, const char *filename, void *dest, int expected_size);
 extern int load_bios_files(long param_1, const char *system_dir);
  
@@ -43,6 +55,11 @@ extern int load_bios_files(long param_1, const char *system_dir);
  extern void screen_copy16(uint16_t *dest, int screen);
  extern int get_screen_bytes_per_pixel(void);
  extern int get_screen_hires_mode(int screen);
+ 
+ // 视频/帧处理（来自 drastic.cpp）
+ extern unsigned long video_render_scanlines(long *param_1, int param_2);
+ extern void start_frame(long *param_1);
+ extern void update_frame(long *param_1);
  
  // 输入处理函数
  extern void update_input(long param_1);

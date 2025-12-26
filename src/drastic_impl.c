@@ -26,6 +26,7 @@ extern "C" {
 // 声明全局系统内存（定义在 drastic_impl.c 中）
 extern undefined1 nds_system[NDS_SYSTEM_SIZE];
 
+extern int debug_enabled; // 是否启用调试模式
 // 内部状态结构
 typedef struct {
     int initialized;
@@ -40,9 +41,13 @@ typedef struct {
     uint32_t input_state;  // 输入状态寄存器
     int use_recompiler;
     unsigned long translate_cache;
+    int test_pattern_written;
 } drastic_state_t;
 
 static drastic_state_t g_state = {0};
+
+// Backup of event_list pointer for debugging/repair purposes
+static uintptr_t g_event_list_ptr_backup = 0;
 
 // 屏幕缓冲区偏移（在 nds_system 中）
 // 根据 drastic.cpp 的分析，屏幕缓冲区应该在视频内存区域
@@ -55,28 +60,176 @@ static drastic_state_t g_state = {0};
 // 事件处理函数（存根实现）
 // 这些函数在 drastic.cpp 中定义，但我们暂时使用存根
 // 注意：这些函数不能是 static，因为我们需要在 execute_events 中检查它们的地址
-void event_hblank_start_function_stub(long param_1, unsigned long param_2) {
-    (void)param_1;
+// Event handlers (implemented based on drastic.cpp behavior)
+void event_hblank_start_function(long param_1, unsigned long param_2) {
     (void)param_2;
-    // 存根实现
+    // Call video_render_scanlines for current scanline if available
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] event_hblank_start: param=0x%lx scanline=%u\n", (unsigned long)param_1, *(unsigned short*)(param_1 + 0x14));
+    }
+    // Attempt to render the just-completed scanline (best-effort)
+    video_render_scanlines((long*)(param_1 + 0x36d1ec0), *(int*)(param_1 + 0x14));
 }
 
-void event_scanline_start_function_stub(long param_1, unsigned long param_2) {
-    (void)param_1;
+void event_scanline_start_function(long param_1, unsigned long param_2) {
     (void)param_2;
-    // 存根实现
+    // Advance scanline counter (ushort at offset 0x14)
+    uint16_t *scanline_ptr = (uint16_t*)(param_1 + 0x14);
+    uint16_t scanline = *scanline_ptr;
+    scanline++;
+
+    if (scanline == 0x107) {
+        // End of frame: start frame processing and reset scanline
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] event_scanline_start: end of frame reached, calling start_frame/update_frame\n");
+        }
+        // start_frame expects a pointer to a per-frame state; original calls at +0x6da3d8
+        start_frame((long*)(param_1 + 0x6da3d8));
+        scanline = 0;
+    } else if (scanline == 0xc0) {
+        // Mid-frame: commit frame and update input
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] event_scanline_start: scanline reached 0xC0, calling update_frame/update_input\n");
+        }
+        update_frame((long*)(param_1 + 0x6da3d8));
+        //update_input(param_1 + 0xAAA);
+    }
+
+    *scanline_ptr = scanline;
 }
 
-void event_force_task_switch_function_stub(long param_1, unsigned long param_2) {
-    (void)param_1;
+void event_force_task_switch_function(long param_1, unsigned long param_2) {
     (void)param_2;
-    // 存根实现
+    // Minimal implementation: set a flag that a task switch should occur.
+    // Original code pushes a special node into the event list — here we simply log.
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] event_force_task_switch: param=0x%lx (noop minimal implementation)\n", (unsigned long)param_1);
+    }
 }
 
-void event_gamecard_irq_function_stub(long param_1, unsigned long param_2) {
-    (void)param_1;
+void event_gamecard_irq_function(long param_1, unsigned long param_2) {
     (void)param_2;
-    // 存根实现
+    // Gamecard IRQ minimal handling: log and set a flag in system if appropriate
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] event_gamecard_irq: param=0x%lx (noop minimal implementation)\n", (unsigned long)param_1);
+    }
+}
+
+// DMA完成事件处理函数
+// 基于 drastic.cpp 中 event_dma_complete_function 的实现（第16304行）
+// 当DMA传输完成时，此函数被调用以处理完成后的操作
+//
+// 参数说明:
+// param_1: 系统状态结构指针（未使用，但保持函数签名一致）
+// param_2: DMA通道结构指针（指向DMA通道的控制结构）
+void event_dma_complete_function(long param_1, long param_2) {
+    (void)param_1;  // param_1 在原始实现中未使用
+    
+    if (!param_2) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] event_dma_complete: NULL param_2\n");
+        }
+        return;
+    }
+    
+    // 读取DMA控制寄存器（偏移0x20）
+    // 控制寄存器位定义：
+    // - bit 25 (0x2000000): 重复模式标志
+    // - bit 30 (0x40000000): IRQ使能标志
+    // - bit 31 (0x80000000): DMA启用标志
+    uint32_t uVar1 = *(uint32_t *)(param_2 + 0x20);
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] event_dma_complete: param_2=0x%lx control=0x%08x\n",
+                (unsigned long)param_2, uVar1);
+    }
+    
+    // 检查bit 25（重复模式）：如果未设置，则禁用DMA
+    if ((uVar1 >> 0x19 & 1) == 0) {
+        // 清除bit 31（DMA启用位），禁用DMA
+        uVar1 = uVar1 & 0x7fffffff;
+        *(uint32_t *)(param_2 + 0x20) = uVar1;
+        
+        // 通过指针写入DMA控制寄存器（param_2 + 0x10 是指向DMA控制寄存器的指针）
+        // 偏移8是控制寄存器的偏移（字节偏移）
+        long *dma_ctrl_ptr = *(long **)(param_2 + 0x10);
+        if (dma_ctrl_ptr) {
+            *(uint32_t *)((char *)dma_ctrl_ptr + 8) = uVar1;
+        }
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] event_dma_complete: disabled DMA (non-repeat mode)\n");
+        }
+    }
+    
+    // 检查bit 30（IRQ使能）：如果设置了，则触发中断
+    if ((uVar1 >> 0x1e & 1) != 0) {
+        // 获取中断控制器指针
+        // param_2 + 0x8 是指向CPU结构的指针
+        // CPU结构 + 0x2080 是中断控制器指针
+        long *cpu_ptr = *(long **)(param_2 + 8);
+        if (!cpu_ptr) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] event_dma_complete: NULL cpu_ptr\n");
+            }
+        } else {
+            // 使用字节偏移访问（drastic.cpp使用字节偏移，不是指针偏移）
+            // cpu_ptr + 0x2080 在drastic.cpp中是字节偏移，需要转换为char*再偏移
+            long lVar2 = *(long *)((char *)cpu_ptr + 0x2080);
+            if (!lVar2) {
+                if (debug_enabled) {
+                    fprintf(stderr, "[DRASTIC] event_dma_complete: NULL interrupt controller\n");
+                }
+            } else {
+                // 计算中断标志位
+                // param_2 + 0x25 是DMA通道编号（低5位）
+                uint8_t channel_num = *(uint8_t *)(param_2 + 0x25) & 0x1f;
+                uint32_t irq_bit = 0x100 << channel_num;  // 每个DMA通道有对应的中断位
+                
+                // 读取当前中断标志寄存器（偏移0x214，使用字节偏移）
+                uint32_t irq_flags = *(uint32_t *)((char *)lVar2 + 0x214);
+                uVar1 = irq_bit | irq_flags;
+                
+                // 设置中断标志
+                *(uint32_t *)((char *)lVar2 + 0x214) = uVar1;
+                
+                if (debug_enabled) {
+                    fprintf(stderr, "[DRASTIC] event_dma_complete: set IRQ channel=%d bit=0x%08x flags=0x%08x\n",
+                            (int)channel_num, irq_bit, uVar1);
+                }
+                
+                // 检查中断掩码（CPU结构 + 0x2110，使用字节偏移）
+                // bit 1和2（值6）如果都未设置，则处理中断请求
+                uint32_t interrupt_mask = *(uint32_t *)((char *)cpu_ptr + 0x2110);
+                if ((interrupt_mask & 6) == 0) {
+                    // 计算中断请求寄存器（偏移0x2108，使用字节偏移）
+                    // 中断请求 = (~中断使能) & 中断标志 & 中断掩码
+                    int32_t irq_enable = *(int32_t *)((char *)lVar2 + 0x208);  // 中断使能寄存器（偏移0x208）
+                    uint32_t irq_mask = *(uint32_t *)((char *)lVar2 + 0x210);  // 中断掩码寄存器（偏移0x210）
+                    
+                    uint32_t irq_request = ((uint32_t)(~irq_enable)) & irq_mask & uVar1;
+                    *(uint32_t *)((char *)cpu_ptr + 0x2108) = irq_request;
+                    
+                    if (debug_enabled) {
+                        fprintf(stderr, "[DRASTIC] event_dma_complete: IRQ request=0x%08x (enable=0x%08x mask=0x%08x)\n",
+                                irq_request, (uint32_t)irq_enable, irq_mask);
+                    }
+                } else {
+                    if (debug_enabled) {
+                        fprintf(stderr, "[DRASTIC] event_dma_complete: interrupts masked (mask=0x%08x)\n",
+                                interrupt_mask);
+                    }
+                }
+            }
+        }
+    }
+    
+    // 清除DMA完成标志（偏移0x26）
+    *(uint8_t *)(param_2 + 0x26) = 0;
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] event_dma_complete: cleared completion flag\n");
+    }
 }
 
 // 初始化事件列表
@@ -96,27 +249,275 @@ void initialize_event_list(long param_1, long param_2) {
     
     // 第一个事件：HBlank 开始（偏移 0）
     typedef void (*event_func_t)(long, unsigned long);
-    *(event_func_t*)(param_1 + 0x8) = (event_func_t)event_hblank_start_function_stub;
+    *(event_func_t*)(param_1 + 0x8) = (event_func_t)event_hblank_start_function;
     *(long*)(param_1 + 0x10) = param_2;
     *(uint8_t*)(param_1 + 0x28) = 0;
     
     // 第二个事件：扫描线开始（偏移 0x20）
-    *(event_func_t*)(param_1 + 0x38) = (event_func_t)event_scanline_start_function_stub;
+    *(event_func_t*)(param_1 + 0x38) = (event_func_t)event_scanline_start_function;
     *(long*)(param_1 + 0x40) = param_2;
     *(uint8_t*)(param_1 + 0x58) = 1;
     
     // 第三个事件：强制任务切换（偏移 0x50）
-    *(event_func_t*)(param_1 + 0x68) = (event_func_t)event_force_task_switch_function_stub;
+    *(event_func_t*)(param_1 + 0x68) = (event_func_t)event_force_task_switch_function;
     *(long*)(param_1 + 0x70) = 0;
     *(uint8_t*)(param_1 + 0x88) = 2;
     
     // 第四个事件：游戏卡 IRQ（偏移 0x200）
-    *(event_func_t*)(param_1 + 0x218) = (event_func_t)event_gamecard_irq_function_stub;
+    *(event_func_t*)(param_1 + 0x218) = (event_func_t)event_gamecard_irq_function;
     *(long*)(param_1 + 0x220) = param_2 + 0x320;  // param_2 + 800 (0x320)
     *(uint8_t*)(param_1 + 0x238) = 0xb;
     
     // 事件列表指针（偏移 0x300）初始化为 NULL
     *(long*)(param_1 + 0x300) = 0;
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_event_list: wrote NULL at event_list addr %p\n", (void*)(param_1 + 0x300));
+    }
+}
+
+// 初始化单个事件（根据 drastic.cpp 的 initialize_event）
+// param_1: 事件列表基址
+// param_2: 事件编号（用来计算偏移：entry = base + id*0x30）
+// param_3: 事件处理函数指针
+// param_4: 事件参数（通常是系统状态结构或事件相关指针）
+void initialize_event(long param_1, unsigned int param_2, void *param_3, long param_4) {
+    if (!param_1) return;
+    long entry = param_1 + (long)param_2 * 0x30L;
+    // 写入函数指针（8 字节）
+    *(void **)(entry + 8) = param_3;
+    // 写入参数（8 字节）
+    *(long *)(entry + 0x10) = param_4;
+    // 写入事件类型/编号（1 字节）
+    *(uint8_t *)(entry + 0x28) = (uint8_t)param_2;
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_event: base=0x%lx id=0x%x entry=0x%lx handler=%p param=0x%lx\n",
+                (unsigned long)param_1, param_2, (unsigned long)entry, param_3, (unsigned long)param_4);
+    }
+}
+
+// 初始化 DMA 通道（简化实现，基于 drastic.cpp initialize_dma）
+// param_1: DMA channel struct base (address in nds_system)
+// param_2: value to store at [0]
+// param_3: value to store at [1]
+// param_4: base offset used to compute several offsets (caller-specific)
+// param_5: system state base (used to register events into the system event list)
+void initialize_dma(long param_1, long param_2, long param_3, long param_4, long param_5) {
+    if (!param_1) return;
+
+    unsigned char *p = (unsigned char *)param_1;
+
+    // clear control byte at +0x35
+    *(uint8_t *)(param_1 + 0x35) = 0;
+
+    // store references according to drastic.cpp layout
+    *(long *)(param_1 + 3 * sizeof(long)) = param_5;               // param_1[3] = param_5
+    *(long *)(param_1 + 4 * sizeof(long)) = param_4 + 0xb0;         // param_1[4] = param_4 + 0xb0
+
+    int iVar1 = *(int *)(param_5 + 0x210c);
+    if (iVar1 == 1) {
+        // register event for DMA channel 0 (id 0xC)
+        initialize_event(*(long *)(param_5 + 0x2258) + 0x18, 0xc, (void *)event_dma_complete_function, param_1 + 2);
+        *(uint8_t *)(param_1 + 0x5d) = 1;
+        *(long *)(param_1 + 8 * sizeof(long)) = param_5;              // param_1[8] = param_5
+        *(long *)(param_1 + 9 * sizeof(long)) = param_4 + 0xbc;       // param_1[9] = param_4 + 0xbc
+    } else {
+        *(uint8_t *)(param_1 + 0x5d) = 1;
+        *(long *)(param_1 + 8 * sizeof(long)) = param_5;
+        *(long *)(param_1 + 9 * sizeof(long)) = param_4 + 0xbc;
+    }
+
+    iVar1 = *(int *)(param_5 + 0x210c);
+    if (iVar1 == 1) {
+        initialize_event(*(long *)(param_5 + 0x2258) + 0x18, 0xd, (void *)event_dma_complete_function, param_1 + 7);
+        *(uint8_t *)(param_1 + 0x85) = 2;
+        *(long *)(param_1 + 0xd * sizeof(long)) = param_5;            // param_1[0xd] = param_5
+        *(long *)(param_1 + 0xe * sizeof(long)) = param_4 + 200;      // param_1[0xe] = param_4 + 200
+    } else {
+        *(uint8_t *)(param_1 + 0x85) = 2;
+        *(long *)(param_1 + 0xd * sizeof(long)) = param_5;
+        *(long *)(param_1 + 0xe * sizeof(long)) = param_4 + 200;
+    }
+
+    iVar1 = *(int *)(param_5 + 0x210c);
+    if (iVar1 == 1) {
+        initialize_event(*(long *)(param_5 + 0x2258) + 0x18, 0xe, (void *)event_dma_complete_function, param_1 + 0xc);
+        *(uint8_t *)(param_1 + 0xad) = 3;
+        *(long *)(param_1 + 0x12 * sizeof(long)) = param_5;           // param_1[0x12] = param_5
+        *(long *)(param_1 + 0x13 * sizeof(long)) = param_4 + 0xd4;    // param_1[0x13] = param_4 + 0xd4
+    } else {
+        *(uint8_t *)(param_1 + 0xad) = 3;
+        *(long *)(param_1 + 0x12 * sizeof(long)) = param_5;
+        *(long *)(param_1 + 0x13 * sizeof(long)) = param_4 + 0xd4;
+    }
+
+    iVar1 = *(int *)(param_5 + 0x210c);
+    if (iVar1 == 1) {
+        initialize_event(*(long *)(param_5 + 0x2258) + 0x18, 0xf, (void *)event_dma_complete_function, param_1 + 0x11);
+        *(long *)(param_1 + 0) = param_2;
+        *(long *)(param_1 + 1 * sizeof(long)) = param_3;
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] initialize_dma: registered events 0xc..0xf for channel @0x%lx\n", (unsigned long)param_1);
+        }
+        return;
+    }
+
+    *(long *)(param_1 + 0) = param_2;
+    *(long *)(param_1 + 1 * sizeof(long)) = param_3;
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_dma: channel @0x%lx initialized without event registration\n", (unsigned long)param_1);
+    }
+}
+
+// 初始化内存：建立简单的页面表并映射几个常用区域
+// 这是对 drastic.cpp 更复杂实现的简化版本，能让解释器正常工作
+void initialize_memory(long param_1) {
+    if (!param_1) return;
+
+    // 在全局 nds_system 中分配两个页面表（ARM7/ARM9），每个表包含 131072 项（address>>11 索引），每项 8 字节
+    // 大小约 1MB/表，放在 nds_system 的安全区域
+    const unsigned long PAGE_ENTRIES = 131072UL; // covers up to 0x04000000 with 2KB pages
+    const unsigned long PAGE_TABLE_BYTES = PAGE_ENTRIES * 8UL;
+    // 选择两个偏移作为页面表位置（在系统可用范围内）
+    unsigned long system_base = (unsigned long)nds_system;
+    unsigned long table1_offset = 0x300000; // 3MB
+    unsigned long table2_offset = 0x400000; // 4MB
+
+    if (system_base + table2_offset + PAGE_TABLE_BYTES >= system_base + sizeof(nds_system)) {
+        // 如果超出范围就不用初始化（防御性处理）
+        return;
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_memory: table1_offset=0x%lx table2_offset=0x%lx entries=%lu bytes=%lu\n",
+                table1_offset, table2_offset, PAGE_ENTRIES, PAGE_TABLE_BYTES);
+    }
+
+    unsigned long *table1 = (unsigned long*)(system_base + table1_offset);
+    unsigned long *table2 = (unsigned long*)(system_base + table2_offset);
+    memset(table1, 0, PAGE_TABLE_BYTES);
+    memset(table2, 0, PAGE_TABLE_BYTES);
+
+    // 简单映射常用区域：ARM9 RAM (0x02000000 - 0x02400000) -> nds_system + 0x1000000
+    unsigned long vstart = 0x02000000UL;
+    unsigned long vend = 0x02400000UL;
+    unsigned long target_base = system_base + 0x1000000UL;
+    unsigned long start_idx = vstart >> 11;
+    unsigned long end_idx = (vend - 1) >> 11;
+    for (unsigned long i = start_idx; i <= end_idx; i++) {
+        unsigned long page_offset = (i - start_idx) * 2048UL;
+        unsigned long physical = target_base + page_offset;
+        table1[i] = physical / 4UL; // interpreter expects page_value*4 + (addr & 0x7FF)
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_memory: mapped 0x%08lx-0x%08lx -> 0x%08lx (entries %lu..%lu)\n",
+                0x02000000UL, 0x02400000UL, target_base, start_idx, end_idx);
+    }
+
+    // 简单映射常用区域：ARM7 RAM (0x02380000 - 0x023BFFFF) -> nds_system + 0x2000000
+    vstart = 0x02380000UL;
+    vend = 0x023C0000UL;
+    target_base = system_base + 0x2000000UL;
+    start_idx = vstart >> 11;
+    end_idx = (vend - 1) >> 11;
+    for (unsigned long i = start_idx; i <= end_idx; i++) {
+        unsigned long page_offset = (i - start_idx) * 2048UL;
+        unsigned long physical = target_base + page_offset;
+        table1[i] = physical / 4UL;
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_memory: mapped ARM7 region 0x%08lx-0x%08lx -> 0x%08lx\n",
+                0x02380000UL, 0x023C0000UL, system_base + 0x2000000UL);
+    }
+
+    // 将页面表地址写入系统结构，供解释器使用
+    // 解释器期望 memory controller 指针在 CPU 结构的偏移 0x23d0
+    // 我们把 ARM7/ARM9 的内存控制器指向 table1/table2
+    unsigned long arm7_cpu_abs = system_base + 0x15c8070UL; // as used by _execute_cpu callers
+    unsigned long arm9_cpu_abs = system_base + 0x25d0408UL; // heuristic location for ARM9
+
+    // 写入 pointer 值（绝对地址作为 long 存储）
+    if (arm7_cpu_abs + 0x23d0 + sizeof(void*) <= system_base + sizeof(nds_system)) {
+        *(unsigned long*)(arm7_cpu_abs + 0x23d0) = system_base + table1_offset;
+    }
+    if (arm9_cpu_abs + 0x23d0 + sizeof(void*) <= system_base + sizeof(nds_system)) {
+        *(unsigned long*)(arm9_cpu_abs + 0x23d0) = system_base + table2_offset;
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_memory: arm7_cpu=%p arm9_cpu=%p table1=%p table2=%p\n",
+                (void*)arm7_cpu_abs, (void*)arm9_cpu_abs, (void*)(system_base + table1_offset), (void*)(system_base + table2_offset));
+    }
+}
+
+// 初始化游戏卡（gamecard）子系统：将游戏卡区域清零并设置标志
+void initialize_gamecard(long param_1) {
+    if (!param_1) return;
+    // 将常见的 gamecard 缓冲区清零（在很多实现中位于系统内存的低地址）
+    unsigned long system_base = (unsigned long)nds_system;
+    unsigned long gamecard_offset = 0x1000UL; // ROM 被拷贝到 param+0x1000，确保此处清理
+    memset((void*)(system_base + gamecard_offset), 0, 0x100000); // 清零 1MB 的 ROM 区域缓存
+
+    // 设置 gamecard 状态标志（如存在位置），这里使用系统状态结构附近的一个字节
+    unsigned long state_flag_addr = system_base + 0x320 + 0x50; // 任意选址的标志字节
+    if (state_flag_addr < system_base + sizeof(nds_system)) {
+        *(uint8_t*)state_flag_addr = 0; // 0 表示未插入 ROM
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_gamecard: cleared ROM area at 0x%lx, state_flag=%p\n",
+                (unsigned long)gamecard_offset, (void*)state_flag_addr);
+    }
+}
+
+// 初始化 CPU 状态（简化实现）：清零 CPU 结构并设置默认寄存器/时间片
+void initialize_cpu(long param_1) {
+    if (!param_1) return;
+
+    unsigned long system_base = (unsigned long)nds_system;
+
+    // ARM7 CPU 结构基址（与 _execute_cpu 的调用一致）
+    unsigned long arm7_cpu_abs = system_base + 0x15c8070UL;
+    // 初始化一个合理大小的 CPU 状态区域
+    size_t cpu_struct_size = 0x20000; // 128KB
+    if (arm7_cpu_abs + cpu_struct_size <= system_base + sizeof(nds_system)) {
+        memset((void*)arm7_cpu_abs, 0, cpu_struct_size);
+        // 设置一些默认寄存器/字段（偏移按 interpreter 期望）
+        // time limit (offset 0x2290)
+        *(uint32_t*)(arm7_cpu_abs + 0x2290) = 0x1000; // 默认执行周期限制
+        // PC (offset 0x23bc)
+        *(uint32_t*)(arm7_cpu_abs + 0x23bc) = 0;
+        // CPSR (offset 0x23c0)
+        *(uint32_t*)(arm7_cpu_abs + 0x23c0) = 0x000000d3; // SVC mode, interrupts enabled (heuristic)
+        // 指向页面表（如果没有设置过）
+        if (*(unsigned long*)(arm7_cpu_abs + 0x23d0) == 0) {
+            *(unsigned long*)(arm7_cpu_abs + 0x23d0) = system_base + 0x300000; // our table1
+        }
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_cpu: ARM7 cpu struct @ %p, time_limit=0x%08x, PC_ptr=%p\n",
+                (void*)arm7_cpu_abs, *(uint32_t*)(arm7_cpu_abs + 0x2290), (void*)(arm7_cpu_abs + 0x23bc));
+    }
+
+    // ARM9 CPU 结构（简化）：只清零并设置少数字段
+    unsigned long arm9_cpu_abs = system_base + 0x25d0408UL;
+    if (arm9_cpu_abs + 0x10000 <= system_base + sizeof(nds_system)) {
+        memset((void*)arm9_cpu_abs, 0, 0x10000);
+        *(uint32_t*)(arm9_cpu_abs + 0x2290) = 0x1000;
+        *(uint32_t*)(arm9_cpu_abs + 0x23bc) = 0;
+        *(uint32_t*)(arm9_cpu_abs + 0x23c0) = 0x000000d3;
+        if (*(unsigned long*)(arm9_cpu_abs + 0x23d0) == 0) {
+            *(unsigned long*)(arm9_cpu_abs + 0x23d0) = system_base + 0x400000; // our table2
+        }
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_cpu: ARM9 cpu struct @ %p, time_limit=0x%08x\n",
+                (void*)arm9_cpu_abs, *(uint32_t*)(arm9_cpu_abs + 0x2290));
+    }
 }
 
 // 加载系统文件（BIOS、固件等）
@@ -194,6 +595,10 @@ int initialize_system(long param_1) {
     // 初始化系统内存
     memset((void*)param_1, 0, sizeof(nds_system));
     
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_system: nds_system=%p, param_1=%p\n", (void*)nds_system, (void*)param_1);
+    }
+
     // 初始化屏幕缓冲区指针
     g_state.screen0_buffer = (void*)(nds_system + SCREEN0_OFFSET);
     g_state.screen1_buffer = (void*)(nds_system + SCREEN1_OFFSET);
@@ -209,6 +614,28 @@ int initialize_system(long param_1) {
     // 初始化屏幕缓冲区为黑色
     memset(g_state.screen0_buffer, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 2);
     memset(g_state.screen1_buffer, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 2);
+
+    // Write a visible test pattern to both screens so we can verify the
+    // rendering path and confirm video_cb receives non-black content.
+    if (!g_state.test_pattern_written) {
+        uint16_t *s0 = (uint16_t*)g_state.screen0_buffer;
+        uint16_t *s1 = (uint16_t*)g_state.screen1_buffer;
+        for (int y = 0; y < SCREEN_HEIGHT; y++) {
+            for (int x = 0; x < SCREEN_WIDTH; x++) {
+                // Checkerboard 8x8 blocks: two contrasting 5:6:5 colors
+                int bx = (x / 8) & 1;
+                int by = (y / 8) & 1;
+                uint16_t color = (bx ^ by) ? 0x07E0 : 0x001F; // green / blue
+                s0[y * SCREEN_WIDTH + x] = color;
+                // Make screen1 the inverse-ish pattern so they differ
+                s1[y * SCREEN_WIDTH + x] = (uint16_t)((~color) & 0x7FFF);
+            }
+        }
+        g_state.test_pattern_written = 1;
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] initialize_system: wrote test pattern to screens (checkerboard)\n");
+        }
+    }
     
     // 设置重编译器标志（在 nds_system 中的偏移 0x3b2a9a8）
     // 0 = 解释器模式，非0 = 重编译器模式
@@ -222,17 +649,48 @@ int initialize_system(long param_1) {
     // 所以我们需要传递系统状态结构的地址
     long system_state_base = param_1 + 0x320;
     initialize_event_list(param_1 + 0x18, system_state_base);
+
+    // Immediately set the event-list pointer here to ensure it is present before
+    // memory/cpu/gamecard initialization (those routines previously could
+    // overwrite the same area in some configurations).
+    {
+        uintptr_t *event_list_ptr_early = (uintptr_t*)(system_state_base + 0x318);
+        *event_list_ptr_early = (uintptr_t)(param_1 + 0x18);
+        // Initialize first event time and timing fields early
+        uint32_t *first_event_time_early = (uint32_t*)(param_1 + 0x18);
+        *first_event_time_early = 0;
+        uint64_t *time_counter_early = (uint64_t*)(system_state_base + 8);
+        if (time_counter_early) *time_counter_early = 0;
+        uint32_t *time_remaining_early = (uint32_t*)(system_state_base + 0x10);
+        if (time_remaining_early) *time_remaining_early = 0;
+    }
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_system: system_state_base=0x%lx, event_list_node=%p, screen0=%p, screen1=%p\n",
+                (unsigned long)system_state_base, (void*)(param_1 + 0x18), g_state.screen0_buffer, g_state.screen1_buffer);
+    }
+
+    // 初始化内存映射、CPU和游戏卡结构
+    // 这些函数在 drastic.cpp 中有更复杂的实现，这里提供一个合理的简化实现
+    initialize_memory(param_1);
+    initialize_gamecard(param_1);
+    initialize_cpu(param_1);
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] initialize_system: memory/cpu/gamecard initialized\n");
+    }
     
     // 设置事件列表指针（根据 drastic.cpp 第17458行，事件列表指针在系统状态结构 + 0x318）
     // 系统状态结构在 nds_system + 0x320，所以事件列表指针在 nds_system + 0x320 + 0x318 = nds_system + 0x638
     // 事件列表的第一个节点在 nds_system + 0x18（根据 initialize_event_list 的实现）
     // 但是，事件列表指针应该指向第一个事件节点，而第一个事件节点的时间字段在偏移 0
     // 所以我们需要将事件列表的第一个节点地址存储在系统状态结构的 0x318 偏移处
-    uint32_t **event_list_ptr = (uint32_t**)(system_state_base + 0x318);
-    *event_list_ptr = (uint32_t*)(param_1 + 0x18);
+    // 事件列表指针（使用指针大小写入以兼容 32/64 位）
+    uintptr_t *event_list_ptr = (uintptr_t*)(system_state_base + 0x318);
+    *event_list_ptr = (uintptr_t)(param_1 + 0x18);
     
     // 初始化第一个事件节点的时间字段为 0（表示立即执行）
-    // 根据 drastic.cpp，事件节点的时间字段在偏移 0
+    // 根据 drastic.cpp，事件节点的时间字段在偏移 0（此实现中时间位于 param_1 + 0x18）
     uint32_t *first_event_time = (uint32_t*)(param_1 + 0x18);
     *first_event_time = 0;
     
@@ -244,6 +702,29 @@ int initialize_system(long param_1) {
     uint32_t *time_remaining = (uint32_t*)(system_state_base + 0x10);
     *time_remaining = 0;
     
+    // Verify the event-list pointer wasn't corrupted by earlier initializers; restore if necessary
+    {
+        uintptr_t stored = *(uintptr_t*)(system_state_base + 0x318);
+        unsigned long sys_base = (unsigned long)nds_system;
+        unsigned long sys_end = sys_base + NDS_SYSTEM_SIZE;
+        if (!(stored >= sys_base && stored < sys_end)) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] initialize_system: event_list_ptr corrupted (0x%lx), restoring to 0x%lx\n",
+                        (unsigned long)stored, (unsigned long)(param_1 + 0x18));
+            }
+            *(uintptr_t*)(system_state_base + 0x318) = (uintptr_t)(param_1 + 0x18);
+        }
+    }
+
+    // Store a backup of the correctly initialized event list pointer so we can detect
+    // and optionally repair corruption during early debugging.
+    {
+        g_event_list_ptr_backup = (uintptr_t)(param_1 + 0x18);
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] initialize_system: g_event_list_ptr_backup set to 0x%016lx\n", (unsigned long)g_event_list_ptr_backup);
+        }
+    }
+
     g_state.initialized = 1;
     return 0;
 }
@@ -561,6 +1042,19 @@ int load_nds(long param_1, const char *param_2) {
     
     memcpy((void*)(param_1 + 0x1000), rom_buffer, copy_size);
     
+    // Diagnostic: print event_list pointer and nearby slots after ROM copy
+    if (debug_enabled) {
+        unsigned long sys_base = (unsigned long)nds_system;
+        unsigned long sys_state = sys_base + 0x320;
+        uintptr_t e_ptr = *(uintptr_t*)(sys_state + 0x318);
+        unsigned long slot0 = *(unsigned long*)(sys_state + 0x300);
+        unsigned long slot1 = *(unsigned long*)(sys_state + 0x308);
+        unsigned long slot2 = *(unsigned long*)(sys_state + 0x310);
+        unsigned long slot3 = *(unsigned long*)(sys_state + 0x318);
+        fprintf(stderr, "[DRASTIC] load_nds: after ROM memcpy: event_list_ptr=0x%016lx slots=0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                (unsigned long)e_ptr, slot0, slot1, slot2, slot3);
+    }
+    
     // 加载 ARM9 程序到内存
     // 根据 drastic.cpp 第 127098-127100 行，使用 memory_region_block_memory_load
     // NDS 内存映射：ARM9 RAM 通常从 0x02000000 开始
@@ -627,7 +1121,18 @@ int load_nds(long param_1, const char *param_2) {
             
             memcpy((void*)target_addr, arm9_src, arm9_copy_size);
             
+            // Diagnostic: print event_list pointer and nearby slots after ARM9 load
             if (debug_enabled) {
+                unsigned long sys_base = (unsigned long)nds_system;
+                unsigned long sys_state = sys_base + 0x320;
+                uintptr_t e_ptr = *(uintptr_t*)(sys_state + 0x318);
+                unsigned long slot0 = *(unsigned long*)(sys_state + 0x300);
+                unsigned long slot1 = *(unsigned long*)(sys_state + 0x308);
+                unsigned long slot2 = *(unsigned long*)(sys_state + 0x310);
+                unsigned long slot3 = *(unsigned long*)(sys_state + 0x318);
+                fprintf(stderr, "[DRASTIC] load_nds: after ARM9 memcpy: event_list_ptr=0x%016lx slots=0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                        (unsigned long)e_ptr, slot0, slot1, slot2, slot3);
+                
                 fprintf(stderr, "[DRASTIC] load_nds: ARM9 program loaded successfully\n");
                 fprintf(stderr, "[DRASTIC] load_nds: ARM9 entry point data (first 16 bytes): ");
                 for (int i = 0; i < 16 && i < arm9_copy_size; i++) {
@@ -680,7 +1185,17 @@ int load_nds(long param_1, const char *param_2) {
             if (target_addr < system_end && target_addr + arm7_copy_size <= system_end) {
                 memcpy((void*)target_addr, arm7_src, arm7_copy_size);
                 
+                // Diagnostic: print event_list pointer and nearby slots after ARM7 load
                 if (debug_enabled) {
+                    unsigned long sys_base = (unsigned long)nds_system;
+                    unsigned long sys_state = sys_base + 0x320;
+                    uintptr_t e_ptr = *(uintptr_t*)(sys_state + 0x318);
+                    unsigned long slot0 = *(unsigned long*)(sys_state + 0x300);
+                    unsigned long slot1 = *(unsigned long*)(sys_state + 0x308);
+                    unsigned long slot2 = *(unsigned long*)(sys_state + 0x310);
+                    unsigned long slot3 = *(unsigned long*)(sys_state + 0x318);
+                    fprintf(stderr, "[DRASTIC] load_nds: after ARM7 memcpy: event_list_ptr=0x%016lx slots=0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                            (unsigned long)e_ptr, slot0, slot1, slot2, slot3);
                     fprintf(stderr, "[DRASTIC] load_nds: ARM7 program loaded successfully\n");
                 }
             } else {
@@ -741,8 +1256,26 @@ void reset_system(long param_1) {
     g_state.input_state = 0xFFFF;
     
     // 重置屏幕缓冲区
-    memset(g_state.screen0_buffer, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 2);
-    memset(g_state.screen1_buffer, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 2);
+    // NOTE: Preserve existing framebuffer contents to avoid wiping the test pattern
+    // which helps debugging when the render path isn't producing output.
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] reset_system: preserving screen buffers (not clearing)");
+        // Dump a small sample of the first 8 pixels from each screen for quick verification
+        uint16_t *s0 = (uint16_t*)g_state.screen0_buffer;
+        uint16_t *s1 = (uint16_t*)g_state.screen1_buffer;
+        fprintf(stderr, " S0 first8:");
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %04x", s0[i]);
+        fprintf(stderr, " S1 first8:");
+        for (int i = 0; i < 8; i++) fprintf(stderr, " %04x", s1[i]);
+        fprintf(stderr, "\n");
+
+        // Also dump the event list pointer located at system_state + 0x318
+        unsigned long sys_base = (unsigned long)nds_system;
+        unsigned long sys_state = sys_base + 0x320;
+        uintptr_t stored = *(uintptr_t*)(sys_state + 0x318);
+        fprintf(stderr, "[DRASTIC] reset_system: event_list_ptr currently 0x%016lx (addr %p)\n",
+                (unsigned long)stored, (void*)(sys_state + 0x318));
+    }
     
     // 重置系统状态
     // 根据 drastic.cpp，需要重置各种子系统
@@ -785,9 +1318,12 @@ void *get_screen_ptr(int screen) {
         ptr = g_state.screen1_buffer;
     }
     
-    if (!debug_printed && ptr) {
-        fprintf(stderr, "[DRASTIC] get_screen_ptr(%d): returning %p\n", screen, ptr);
-        if (screen == 1) debug_printed = 1;
+    if (debug_enabled) {
+        if (ptr) {
+            fprintf(stderr, "[DRASTIC] get_screen_ptr(%d): returning %p\n", screen, ptr);
+        } else {
+            fprintf(stderr, "[DRASTIC] get_screen_ptr(%d): returning NULL\n", screen);
+        }
     }
     
     return ptr;
@@ -811,6 +1347,10 @@ void screen_copy16(uint16_t *dest, int screen) {
     }
     
     void *src = get_screen_ptr(screen);
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] screen_copy16: screen=%d src=%p pitch=%u hires=%d bpp=%d\n",
+                screen, src, get_screen_pitch(screen), get_screen_hires_mode(screen), get_screen_bytes_per_pixel());
+    }
     if (!src) {
         // 如果源缓冲区不存在，填充黑色
         memset(dest, 0, SCREEN_WIDTH * SCREEN_HEIGHT * sizeof(uint16_t));
@@ -829,6 +1369,12 @@ void screen_copy16(uint16_t *dest, int screen) {
         uint16_t *dest_end = dest + SCREEN_WIDTH;
         
         for (int y = 0; y < SCREEN_HEIGHT; y++) {
+            if (debug_enabled && y == 0) {
+                // 打印第一行前几个像素样本（如果可能）
+                uint16_t *s = (uint16_t*)src_ptr;
+                fprintf(stderr, "[DRASTIC] screen_copy16: screen=%d first pixels: 0x%04x 0x%04x 0x%04x\n",
+                        screen, s[0], s[1], s[2]);
+            }
             uint16_t *dest_ptr = dest_line;
             unsigned int src_x = 0;
             
@@ -916,57 +1462,65 @@ void platform_get_input(long param_1, void *param_2, int param_3) {
 // param_1 在调用时传入的是 nds_system 的地址(绝对地址)
 // 但在实现中需要计算相对于 nds_system 的偏移量来访问数据
 void cpu_next_action_arm7_to_event_update(long param_1) {
-    // 计算相对于 nds_system 的偏移量
+    // 计算相对于 nds_system 的偏移量（兼容传入绝对地址或偏移）
     unsigned long system_base = (unsigned long)nds_system;
-    long system_offset = param_1 - system_base;  // 应该是 0x320
-    
+    long system_offset;
+    if ((unsigned long)param_1 >= system_base && (unsigned long)param_1 < system_base + NDS_SYSTEM_SIZE) {
+        system_offset = (long)((unsigned long)param_1 - system_base);
+    } else {
+        system_offset = param_1;
+    }
+
     uint32_t uVar1, uVar2, uVar5, uVar6;
     int iVar3, iVar4, iVar7;
-    
-    // 执行事件
-    execute_events_no_param();
-    
-    // ARM7 CPU 状态检查
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] cpu_next_action: ENTRY system_offset=0x%lx\n", (unsigned long)system_offset);
+    }
+
+    // 触发并处理事件（使用系统状态结构在 nds_system + 0x320）
+    execute_events((long)(nds_system + 0x320), 0);
+
+    // ---- ARM7 中断 / 任务切换处理 ----
     if (*(int *)(nds_system + system_offset + 0x10cde58) != 0) {
-        // ARM7 中断处理
+        // 读取中断/任务切换信息
         uVar1 = *(uint32_t *)(nds_system + system_offset + 0x10ce110);
         uVar2 = *(uint32_t *)(nds_system + system_offset + 0x10cde60);
         *(uint32_t *)(nds_system + system_offset + 0x10cde60) = 0;
         *(uint32_t *)(nds_system + system_offset + 0x10cdff8) = 0;
         iVar3 = *(int *)(nds_system + system_offset + 0x10cde5c);
-        
-        if ((uVar1 >> 7 & 1) == 0) {
-            // 不在中断模式
+
+        if (((uVar1 >> 7) & 1) == 0) {
+            // 不在中断模式：保存返回地址/状态并设置向量
             uVar5 = *(uint32_t *)(nds_system + system_offset + 0x10ce10c);
             uVar6 = *(uint32_t *)(nds_system + system_offset + 0x10cde54);
-            
+
             if ((uVar5 & 1) == 0) {
                 // ARM 模式
-                iVar7 = uVar5 + 4;
+                iVar7 = (int)uVar5 + 4;
                 if (uVar6 != 2) {
                     *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x10cdde0) =
-                         *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
+                        *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
                     if (uVar6 == 1) {
-                        // FIQ 模式寄存器组
                         if (system_offset + 0x15c9e18U < system_offset + 0x15ca0f0U &&
                             system_offset + 0x15ca0e0U < system_offset + 0x15c9e28U) {
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde18);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde20);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         } else {
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde20);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde18);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         }
                     } else {
                         *(uint32_t *)(nds_system + system_offset + 0x10ce0f4) =
-                             *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
+                            *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
                     }
                     *(uint32_t *)(nds_system + system_offset + 0x10cde54) = 2;
                     *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
@@ -982,27 +1536,27 @@ void cpu_next_action_arm7_to_event_update(long param_1) {
                     *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
                 } else {
                     *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x10cdde0) =
-                         *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
+                        *(uint64_t *)(nds_system + system_offset + 0x10ce0f4);
                     if (uVar6 == 1) {
                         if (system_offset + 0x15c9e18U < system_offset + 0x15ca0f0U &&
                             system_offset + 0x15ca0e0U < system_offset + 0x15c9e28U) {
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde18);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde20);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         } else {
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e8) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde20);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde20);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0e0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde18);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde18);
                             *(uint64_t *)(nds_system + system_offset + 0x10ce0f0) =
-                                 *(uint64_t *)(nds_system + system_offset + 0x10cde28);
+                                *(uint64_t *)(nds_system + system_offset + 0x10cde28);
                         }
                     } else {
                         *(uint32_t *)(nds_system + system_offset + 0x10ce0f4) =
-                             *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
+                            *(uint32_t *)(nds_system + system_offset + 0x10cddf0);
                     }
                     *(uint32_t *)(nds_system + system_offset + 0x10cde54) = 2;
                     *(int *)(nds_system + system_offset + 0x10ce0f8) = iVar7;
@@ -1016,186 +1570,216 @@ void cpu_next_action_arm7_to_event_update(long param_1) {
                     *(uint32_t *)(nds_system + system_offset + 0x10cde40) = uVar1 | 0x20;
                 }
             }
-            
+
             // 设置中断向量
             iVar7 = 0x18;
             if (iVar3 == 1) {
                 iVar7 = *(int *)(*(long *)(nds_system + system_offset + 0x10cdfa0) + 0x10) + 0x18;
             }
             *(int *)(nds_system + system_offset + 0x10ce10c) = iVar7;
-            *(uint32_t *)(nds_system + system_offset + 0x10ce110) = uVar1 & 0xffffffc0 | 0x92;
-            
+            *(uint32_t *)(nds_system + system_offset + 0x10ce110) = (uVar1 & 0xffffffc0) | 0x92;
+
             if (iVar3 == 0 && uVar2 != 0) {
-                goto LAB_ARM7_TASK_SWITCH;
+                // 需要任务切换：跳转到任务切换处理
+                if (1 < uVar2) {
+                    *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) =
+                        *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) & 0xfffffffd;
+                }
             }
         } else {
             // 在中断模式
             if (iVar3 == 0 && uVar2 != 0) {
-LAB_ARM7_TASK_SWITCH:
                 if (1 < uVar2) {
                     *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) =
-                         *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) & 0xfffffffd;
+                        *(uint32_t *)(*(long *)(nds_system + system_offset + 0x10cdff0) + 0x2110) & 0xfffffffd;
                 }
-                // 调用任务切换函数
-                // event_force_task_switch_function(*(undefined8 *)(nds_system + system_offset + 0x10cdfa8), 0);
             }
         }
     }
-    
-    // ARM9 CPU 状态检查
-    if (*(int *)(nds_system + system_offset + 0x20d4448) == 0) goto LAB_FINAL;
-    
-    // ARM9 中断处理(结构与 ARM7 类似)
-    uVar1 = *(uint32_t *)(nds_system + system_offset + 0x20d4700);
-    uVar2 = *(uint32_t *)(nds_system + system_offset + 0x20d4450);
-    *(uint32_t *)(nds_system + system_offset + 0x20d4450) = 0;
-    *(uint32_t *)(nds_system + system_offset + 0x20d45e8) = 0;
-    iVar3 = *(int *)(nds_system + system_offset + 0x20d444c);
-    
-    if ((uVar1 >> 7 & 1) == 0) {
-        uVar5 = *(uint32_t *)(nds_system + system_offset + 0x20d46fc);
-        uVar6 = *(uint32_t *)(nds_system + system_offset + 0x20d4444);
-        
-        if ((uVar5 & 1) == 0) {
-            // ARM 模式
-            iVar7 = uVar5 + 4;
-            if (uVar6 != 2) {
-                *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
-                     *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
-                if (uVar6 == 1) {
-                    if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
-                        system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+
+    // ---- ARM9 中断 / 任务切换处理 ----
+    if (*(int *)(nds_system + system_offset + 0x20d4448) != 0) {
+        uVar1 = *(uint32_t *)(nds_system + system_offset + 0x20d4700);
+        uVar2 = *(uint32_t *)(nds_system + system_offset + 0x20d4450);
+        *(uint32_t *)(nds_system + system_offset + 0x20d4450) = 0;
+        *(uint32_t *)(nds_system + system_offset + 0x20d45e8) = 0;
+        iVar3 = *(int *)(nds_system + system_offset + 0x20d444c);
+
+        if (((uVar1 >> 7) & 1) == 0) {
+            uVar5 = *(uint32_t *)(nds_system + system_offset + 0x20d46fc);
+            uVar6 = *(uint32_t *)(nds_system + system_offset + 0x20d4444);
+
+            if ((uVar5 & 1) == 0) {
+                // ARM 模式
+                iVar7 = (int)uVar5 + 4;
+                if (uVar6 != 2) {
+                    *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
+                    if (uVar6 == 1) {
+                        if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
+                            system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                        } else {
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        }
                     } else {
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
+                            *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
                     }
+                    *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
+                    *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
                 } else {
-                    *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
-                         *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
+                    *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
                 }
-                *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
-                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
+                *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
             } else {
-                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
-            }
-            *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
-        } else {
-            // Thumb 模式
-            *(uint32_t *)(nds_system + system_offset + 0x20d46fc) = uVar5 & 0xfffffffe;
-            iVar7 = (uVar5 & 0xfffffffe) + 4;
-            if (uVar6 == 2) {
-                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
-            } else {
-                *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
-                     *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
-                if (uVar6 == 1) {
-                    if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
-                        system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                // Thumb 模式
+                *(uint32_t *)(nds_system + system_offset + 0x20d46fc) = uVar5 & 0xfffffffe;
+                iVar7 = (uVar5 & 0xfffffffe) + 4;
+                if (uVar6 == 2) {
+                    *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
+                } else {
+                    *(uint64_t *)(nds_system + system_offset + (unsigned long)uVar6 * 8 + 0x20d43d0) =
+                        *(uint64_t *)(nds_system + system_offset + 0x20d46e4);
+                    if (uVar6 == 1) {
+                        if (system_offset + 0x25d0408U < system_offset + 0x25d06e0U &&
+                            system_offset + 0x25d06d0U < system_offset + 0x25d0418U) {
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                        } else {
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4418);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4410);
+                            *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
+                                *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        }
                     } else {
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46e0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4418);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d8) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4410);
-                        *(uint64_t *)(nds_system + system_offset + 0x20d46d0) =
-                             *(uint64_t *)(nds_system + system_offset + 0x20d4408);
+                        *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
+                            *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
                     }
-                } else {
-                    *(uint32_t *)(nds_system + system_offset + 0x20d46e4) =
-                         *(uint32_t *)(nds_system + system_offset + 0x20d43e0);
+                    *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
+                    *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
+                    if ((uVar5 & 1) == 0) {
+                        *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
+                    } else {
+                        *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1 | 0x20;
+                    }
                 }
-                *(uint32_t *)(nds_system + system_offset + 0x20d4444) = 2;
-                *(int *)(nds_system + system_offset + 0x20d46e8) = iVar7;
-                if ((uVar5 & 1) == 0) {
-                    *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1;
-                } else {
+                if ((uVar5 & 1) != 0) {
                     *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1 | 0x20;
                 }
             }
-            if ((uVar5 & 1) != 0) {
-                *(uint32_t *)(nds_system + system_offset + 0x20d4430) = uVar1 | 0x20;
+
+            // 设置中断向量
+            iVar7 = 0x18;
+            if (iVar3 == 1) {
+                iVar7 = *(int *)(*(long *)(nds_system + system_offset + 0x20d4590) + 0x10) + 0x18;
+            }
+            *(int *)(nds_system + system_offset + 0x20d46fc) = iVar7;
+            *(uint32_t *)(nds_system + system_offset + 0x20d4700) = (uVar1 & 0xffffffc0) | 0x92;
+
+            if (iVar3 == 0 && uVar2 != 0) {
+                // 需要任务切换时设置标志位
+                if (1 < uVar2) {
+                    *(uint32_t *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) =
+                        *(uint32_t *)(*(long *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) & 0xfffffffd);
+                }
             }
         }
-        
-        // 设置中断向量
-        iVar7 = 0x18;
-        if (iVar3 == 1) {
-            iVar7 = *(int *)(*(long *)(nds_system + system_offset + 0x20d4590) + 0x10) + 0x18;
-        }
-        *(int *)(nds_system + system_offset + 0x20d46fc) = iVar7;
-        *(uint32_t *)(nds_system + system_offset + 0x20d4700) = uVar1 & 0xffffffc0 | 0x92;
-        
-        if (iVar3 != 0 || uVar2 == 0) goto LAB_FINAL;
-    } else {
-        // 在中断模式
-        if (iVar3 != 0 || uVar2 == 0) goto LAB_FINAL;
     }
-    
-    // ARM9 任务切换处理
-    if (1 < uVar2) {
-        *(uint32_t *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) =
-             *(uint32_t *)(*(long *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) & 0xfffffffd;
-    }
-    // event_force_task_switch_function(*(undefined8 *)(nds_system + system_offset + 0x20d4598), 0);
-    
+
 LAB_FINAL:
-    // 最终处理阶段：更新时间计数器和执行 CPU
-    // 这是函数的统一出口点，无论前面走了哪个中断处理分支
-    
-    // 获取当前事件列表的时间增量
-    // param_1 + 0x318: 事件列表指针的地址
-    // **(int **)(param_1 + 0x318): 取事件列表第一个节点的时间值
-    iVar3 = **(int **)(param_1 + 0x318);
-    
-    // ARM7 相关状态
+    // 最终处理阶段：更新时间计数器并执行 CPU
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] cpu_next_action: LAB_FINAL - preparing to run CPU or task switch\n");
+    }
+
+    // 读取下一个事件的时间（事件列表在 param_1 + 0x318）
+    // 如果 param_1 是绝对地址，使用 param_1；否则计算为 system_base + system_offset + 0x320
+    long sys_state_addr = (long)(system_base + system_offset + 0x320);
+
+    // 小心读取事件列表指针，防止无效指针导致崩溃（参见 SIGSEGV 报告）
+    uintptr_t event_list_addr = *(uintptr_t*)(sys_state_addr + 0x318);
+    unsigned long system_end = system_base + NDS_SYSTEM_SIZE;
+
+    // Treat a NULL event list pointer as "no scheduled events" (quietly).
+    // Only log/attempt repair when the pointer is non-zero and outside valid memory.
+    if (event_list_addr == 0) {
+        // no events scheduled
+        iVar3 = 0;
+    } else if (event_list_addr < system_base || event_list_addr + 4 > system_end) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] cpu_next_action: invalid non-zero event_list pointer at 0x%lx (value=0x%lx) - attempting repair\n",
+                    (unsigned long)(sys_state_addr + 0x318), (unsigned long)event_list_addr);
+            // Dump raw nearby words for debugging
+            unsigned long slot0 = *(unsigned long*)(sys_state_addr + 0x300);
+            unsigned long slot1 = *(unsigned long*)(sys_state_addr + 0x308);
+            unsigned long slot2 = *(unsigned long*)(sys_state_addr + 0x310);
+            unsigned long slot3 = *(unsigned long*)(sys_state_addr + 0x318);
+            fprintf(stderr, "[DRASTIC] cpu_next_action: raw slots @+0x300..+0x318: 0x%016lx 0x%016lx 0x%016lx 0x%016lx\n",
+                    slot0, slot1, slot2, slot3);
+        }
+        // Attempt to repair using backup if available and valid
+        if (g_event_list_ptr_backup && g_event_list_ptr_backup >= system_base && g_event_list_ptr_backup < system_end) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] cpu_next_action: repairing event_list_ptr to backup 0x%016lx\n", (unsigned long)g_event_list_ptr_backup);
+            }
+            *(uintptr_t*)(sys_state_addr + 0x318) = g_event_list_ptr_backup;
+            event_list_addr = g_event_list_ptr_backup;
+            iVar3 = *(int *)event_list_addr;
+        } else {
+            iVar3 = 0;
+        }
+    } else {
+        iVar3 = *(int *)event_list_addr;  // 读取事件节点的时间字段
+    }
+
+    // ARM7 状态
     iVar7 = *(int *)(nds_system + system_offset + 0x10cde60);  // ARM7 任务切换标志
     iVar4 = *(int *)(nds_system + system_offset + 0x10cdfe0);  // ARM7 时间累加器
-    
-    // 更新剩余时间和时间累加器
-    *(int *)(param_1 + 0x10) = iVar3;  // 设置剩余时间
+
+    // 更新剩余时间和累加器
+    *(int *)(sys_state_addr + 0x10) = iVar3;  // 设置剩余时间
     *(int *)(nds_system + system_offset + 0x10cdfe0) = iVar4 + iVar3;  // 累加时间
-    
-    // 检查是否需要任务切换
+
+    // 如果需要任务切换，调用回调并返回
     if (iVar7 != 0) {
-        // 需要任务切换：设置最大剩余时间，执行特殊处理函数
         *(uint32_t *)(nds_system + system_offset + 0x10cdfe0) = 0xffffffff;
         typedef void (*cpu_func_t)(long);
         cpu_func_t *func_ptr = (cpu_func_t *)(nds_system + system_offset + 0x10ce100);
         if (func_ptr && *func_ptr) {
-            (*func_ptr)(param_1);  // 传入系统状态结构地址
+            (*func_ptr)(sys_state_addr);
         }
         return;
     }
-    
-    // 正常执行 CPU：执行 ARM7 处理器
-    // 0x15c7d50 是 ARM7 CPU 执行器结构相对于系统状态结构的偏移
-    // param_1 + 0x15c7d50 = (nds_system + 0x320) + 0x15c7d50
-    //                     = nds_system + 0x15c8070 (ARM7 CPU 执行器)
-    _execute_cpu(param_1 + 0x15c7d50);
-    
-    // 执行完 CPU 后的回调函数
-    // 这通常用于处理 DMA、定时器等需要在 CPU 执行后更新的子系统
+
+    // 执行 ARM7 CPU
+    _execute_cpu(sys_state_addr + 0x15c7d50);
+    /*
+    // CPU 执行后的回调（例如 DMA/定时器等）
     typedef void (*cpu_func2_t)(unsigned long);
     cpu_func2_t *func2_ptr = (cpu_func2_t *)(nds_system + system_offset + 0x10ce100);
     long *param2_ptr = (long *)(nds_system + system_offset + 0x10cdfa8);
     if (func2_ptr && *func2_ptr && param2_ptr) {
         (*func2_ptr)((unsigned long)*param2_ptr);
     }
+    */
 }
 
 // CPU 模拟 - 重编译器模式
@@ -1314,17 +1898,14 @@ void execute_events(long param_1, unsigned long param_2) {
         // 如果有处理函数，调用它
         // 安全检查：确保函数指针有效
         if (handler) {
-            // 检查函数指针是否是我们定义的存根函数之一
-            unsigned long handler_addr = (unsigned long)handler;
-            // 只允许调用我们定义的存根函数
-            if (handler_addr == (unsigned long)event_hblank_start_function_stub ||
-                handler_addr == (unsigned long)event_scanline_start_function_stub ||
-                handler_addr == (unsigned long)event_force_task_switch_function_stub ||
-                handler_addr == (unsigned long)event_gamecard_irq_function_stub) {
-                // 调用处理函数
-                handler(param_1, event_param);
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] execute_events: event at node %p handler=%p param=0x%lx next=%p\n",
+                        (void*)event_node, (void*)handler, event_param, (void*)next_event_node);
             }
-            // 如果函数指针不是我们定义的存根函数，跳过调用（避免段错误）
+            // Call handler unconditionally (if non-NULL). This allows the event system
+            // to invoke the appropriate internal handlers implemented in this core.
+            handler(param_1, event_param);
+
         }
         
         // 如果事件列表为空，返回

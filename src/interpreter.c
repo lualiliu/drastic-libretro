@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <stdio.h>
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,6 +18,7 @@ extern "C" {
 // 声明全局系统内存（定义在 drastic_impl.c 中）
 extern undefined1 nds_system[NDS_SYSTEM_SIZE];
 
+extern int debug_enabled; // 是否启用调试模式
 // CPU 执行函数
 // 基于 drastic.cpp 中 _execute_cpu 的实现（第24829行）
 // param_1 是指向 CPU 状态结构的指针（通常是 param_1 + 0x15c7d50 对于 ARM7）
@@ -28,6 +29,10 @@ void _execute_cpu(long param_1) {
     
     // 根据 drastic.cpp 第24852行，获取执行时间限制
     uint32_t time_limit = *(uint32_t*)(param_1 + 0x2290);
+    if (debug_enabled) {
+        uint32_t pc_init = *(uint32_t*)(param_1 + 0x23bc);
+        fprintf(stderr, "[DRASTIC] _execute_cpu: entry param=%p time_limit=0x%08x pc=0x%08x\n", (void*)param_1, time_limit, pc_init);
+    }
     
     // 检查时间限制是否有效（第24853行）
     if ((int)time_limit < 0) {
@@ -185,6 +190,11 @@ void _execute_cpu(long param_1) {
         *(uint32_t*)(param_1 + 0x2290) = time_limit - cycles;
     } else {
         *(uint32_t*)(param_1 + 0x2290) = 0xFFFFFFFF;
+    }
+    if (debug_enabled) {
+        uint32_t time_rem = *(uint32_t*)(param_1 + 0x2290);
+        uint32_t pc_final = *(uint32_t*)(param_1 + 0x23bc);
+        fprintf(stderr, "[DRASTIC] _execute_cpu: exit time_remaining=0x%08x pc=0x%08x cycles=%d\n", time_rem, pc_final, cycles);
     }
 }
 
