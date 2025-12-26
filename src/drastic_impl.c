@@ -916,6 +916,7 @@ void platform_get_input(long param_1, void *param_2, int param_3) {
 // param_1 在调用时传入的是 nds_system 的地址(绝对地址)
 // 但在实现中需要计算相对于 nds_system 的偏移量来访问数据
 void cpu_next_action_arm7_to_event_update(long param_1) {
+    /*
     // 计算相对于 nds_system 的偏移量
     unsigned long system_base = (unsigned long)nds_system;
     long system_offset = param_1 - system_base;  // 应该是 0x320
@@ -1149,7 +1150,7 @@ LAB_ARM7_TASK_SWITCH:
     // ARM9 任务切换处理
     if (1 < uVar2) {
         *(uint32_t *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) =
-             *(uint32_t *)(*(long *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) & 0xfffffffd;
+             *(uint32_t *)(*(long *)(*(long *)(nds_system + system_offset + 0x20d45e0) + 0x2110) & 0xfffffffd);
     }
     // event_force_task_switch_function(*(undefined8 *)(nds_system + system_offset + 0x20d4598), 0);
     
@@ -1196,6 +1197,7 @@ LAB_FINAL:
     if (func2_ptr && *func2_ptr && param2_ptr) {
         (*func2_ptr)((unsigned long)*param2_ptr);
     }
+    */
 }
 
 // CPU 模拟 - 重编译器模式
