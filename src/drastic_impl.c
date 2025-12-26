@@ -1935,6 +1935,71 @@ void drastic_set_input_state(uint16_t input) {
     g_state.input_state = (uint32_t)input;
 }
 
+// Forward declarations for video/frame helpers implemented in drastic.cpp
+extern void remap_palette_oam_deferred(long param_1);
+extern void remap_palette_oam_direct(long param_1);
+extern void video_2d_reorder_obj(long *param_1);
+extern void video_2d_map_bg_direct_layers(long *param_1);
+extern void update_frame_geometry(long *param_1);
+extern void update_screen(unsigned long param_1);
+
+// start_frame: minimal, safe implementation based on drastic.cpp behavior
+void start_frame(long *param_1) {
+    if (!param_1) return;
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] start_frame: called param=%p\n", (void*)param_1);
+    }
+
+    // Perform deferred palette/OAM remap for this frame
+    // The original implementation does more setup; this minimal variant
+    // keeps palette/OAM consistent before rendering begins.
+    remap_palette_oam_deferred((long)param_1);
+
+    // Reorder objects and map direct BG layers for both 2D contexts
+    // (these calls are safe no-ops if internals are not yet initialized)
+    video_2d_reorder_obj(param_1 + 0x5cf);
+    video_2d_map_bg_direct_layers(param_1 + 0x5cf);
+    video_2d_reorder_obj(param_1 + 0x10853);
+    video_2d_map_bg_direct_layers(param_1 + 0x10853);
+
+    // Reset per-frame scanline index used by video_render_scanlines (short at +0x458894)
+    // Keep this guarded; writing directly mimics the original without heavy logic
+    short *scanline_ptr = (short *)((char *)param_1 + 0x458894);
+    *scanline_ptr = 0;
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] start_frame: completed for param=%p scanline=0\n", (void*)param_1);
+    }
+}
+
+// update_frame: render full frame and update screen geometry/status
+void update_frame(long *param_1) {
+    if (!param_1) return;
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] update_frame: called param=%p\n", (void*)param_1);
+    }
+
+    // Render all scanlines for this frame (0xBF = 191 last scanline index)
+    video_render_scanlines(param_1, 0xBF);
+
+    // Perform direct palette remap (the original may pass a screen base address)
+    remap_palette_oam_direct(*param_1);
+
+    // Update screen(s) and composite to final buffers
+    // We choose conservative behavior: always update both screens
+    update_screen(0);
+    update_screens();
+
+    // Update frame geometry (layout/3D state)
+    update_frame_geometry(param_1 + 0x6ad9e);
+
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] update_frame: finished for param=%p\n", (void*)param_1);
+    }
+}
+
 #ifdef __cplusplus
 }
 #endif
