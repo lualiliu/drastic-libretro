@@ -12,6 +12,9 @@
 #include <stdbool.h>
 #include <setjmp.h>
 #include <unistd.h>
+#include <time.h>
+#include <pthread.h>
+#include <wchar.h>
 
 // POSIX headers (guarded for non-POSIX platforms)
 #ifdef _WIN32
@@ -20,11 +23,26 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <fcntl.h>
 #endif
 
 #include "libretro.h"
-#include "drastic.h"
 
+// 定义 NDS 系统大小（在包含其他头文件之前）
+// 注意：这里定义为常量而不是宏，以便其他文件可以通过 extern 引用
+// 使用 __attribute__((visibility("default"))) 确保符号被导出
+__attribute__((visibility("default"))) const size_t NDS_SYSTEM_SIZE = 62042112;
+
+// 定义 DRASTIC_LIBRETRO 宏，以便头文件知道这是 libretro 模式
+#define DRASTIC_LIBRETRO
+
+// 现在包含其他头文件
+#include "drastic_cpu.h"
+#include "drastic_functions.h"
+#include "drastic_val.h"
+
+// 定义 nds_system 数组（在包含头文件之后，因为头文件中可能有 extern 声明）
+// 在 libretro 模式下，nds_system 应该是一个全局数组
 undefined1 nds_system[NDS_SYSTEM_SIZE];
 
 // 调试输出标志
@@ -89,6 +107,13 @@ static uintptr_t get_current_framebuffer_cb(void)
 // 所有 libretro API 函数必须使用 C 链接，以便 RetroArch 能够正确找到符号
 extern "C" {
 
+// 添加构造函数，在库加载时输出调试信息
+__attribute__((constructor))
+static void drastic_libretro_constructor(void) {
+    fprintf(stderr, "[DRASTIC] Library loaded, constructor called\n");
+    fflush(stderr);
+}
+
 void retro_init(void)
 {
     if (debug_enabled) {
@@ -106,14 +131,9 @@ void retro_init(void)
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_init: Allocating frame buffer (%dx%d)\n", frame_width, frame_height);
     }
-    // 分配并初始化为0
-    //nds_system = (unsigned char*)malloc(NDS_SYSTEM_SIZE);
-    if (nds_system != NULL) {
-        memset(nds_system, 0, NDS_SYSTEM_SIZE);  // 初始化为0
-    } else {
-        // 处理内存分配失败
-        printf("[DRASTIC] retro_init: ERROR: Failed to allocate nds_system memory\n");
-    }
+    // nds_system 是一个全局数组，不需要动态分配，只需要初始化为0
+    memset(nds_system, 0, sizeof(nds_system));  // 初始化为0
+    
     frame_buffer = (uint16_t*)calloc(frame_width * frame_height, sizeof(uint16_t));
     if (!frame_buffer) {
         if (debug_enabled) {
@@ -125,18 +145,8 @@ void retro_init(void)
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_init: Initializing system...\n");
     }
-    // Initialize drastic system
-    int sys_result = initialize_system(nds_system);
-    if (sys_result < 0) {
-        if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_init: ERROR: initialize_system failed\n");
-        }
-        if (frame_buffer) {
-            free(frame_buffer);
-            frame_buffer = NULL;
-        }
-        return;
-    }
+    // Initialize drastic system (returns void)
+    initialize_system((long)nds_system);
     
     // 加载 BIOS 文件
     // 获取系统目录路径
@@ -158,22 +168,108 @@ void retro_init(void)
         }
     }
     
+    // 再次检查 system_dir 是否为 NULL（防御性编程）
+    if (!system_dir) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: system_dir is NULL after initialization!\n");
+        }
+        return;
+    }
+    
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_init: System directory: %s\n", system_dir);
     }
     
-    // 加载 BIOS（使用系统状态结构地址）
+    // 设置系统目录路径（load_system_file 会从 nds_system + 0x8a780 指向的路径下的 system 子目录加载文件）
+    // 将系统目录路径复制到 nds_system + 0x8a780
+    // 安全检查：确保 nds_system 不为 NULL 且偏移量在有效范围内
+    if (!nds_system) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: nds_system is NULL!\n");
+        }
+        return;
+    }
+    
+    const size_t path_offset = 0x8a780;
+    const size_t max_path_size = 1024;  // 路径缓冲区大小
+    if (path_offset + max_path_size > sizeof(nds_system)) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: Path offset 0x%zx exceeds system size!\n", path_offset);
+        }
+        return;
+    }
+    
+    char *base_path = (char *)(nds_system + path_offset);
+    size_t system_dir_len = strlen(system_dir);
+    
+    // 确保路径长度不超过缓冲区大小
+    size_t copy_len = (system_dir_len < max_path_size - 1) ? system_dir_len : max_path_size - 1;
+    
+    // 使用 memcpy 和手动添加 null 终止符，避免 strncpy 的问题
+    memcpy(base_path, system_dir, copy_len);
+    base_path[copy_len] = '\0';
+    
+    if (system_dir_len >= max_path_size - 1) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: WARNING: System directory path truncated (length=%zu, max=%zu)\n", 
+                    system_dir_len, max_path_size - 1);
+        }
+    }
+    
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Base path set to: %s\n", base_path);
+    }
+    
+    // 初始化系统目录（这会创建 system 子目录）
+    initialize_system_directory((long)nds_system, "system");
+    
+    // 加载 BIOS（使用 load_system_file 函数）
     // 注意：BIOS 加载失败不应该阻止核心初始化
     // 如果没有 BIOS，核心可能无法正常运行，但至少可以加载
-    extern int load_bios_files(long param_1, const char *system_dir);
-    int bios_result = load_bios_files((long)nds_system + 0x320, system_dir);
-    if (bios_result < 0) {
+    // ARM9 BIOS: 4KB (0x1000) at offset 0x2004 (或 0x35e4950)
+    // ARM7 BIOS: 16KB (0x4000) at offset 0x2204 (或 0x35e5950)
+    // 根据 source_ref.cpp，初始化时使用 0x2004 和 0x2204
+    // load_system_file 返回 undefined8 (unsigned long)，但实际返回 -1 (0xffffffff) 表示失败，0 表示成功
+    long bios_result = 0;
+    
+    // 尝试加载 ARM9 BIOS
+    undefined8 arm9_result = load_system_file((long)nds_system, (undefined8)(unsigned long)(char*)"nds_bios_arm9.bin", 
+                                        nds_system + 0x2004, 0x1000);
+    if ((long)arm9_result < 0) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: Can't find Nintendo ARM9 BIOS. Trying free DraStic ARM9 BIOS.\n");
+        }
+        arm9_result = load_system_file((long)nds_system, (undefined8)(unsigned long)(char*)"drastic_bios_arm9.bin", 
+                                        nds_system + 0x2004, 0x1000);
+        if ((long)arm9_result >= 0) {
+            // 设置标志位（bit 2）
+            nds_system[0xfd512] |= 2;
+        }
+    }
+    
+    // 尝试加载 ARM7 BIOS
+    undefined8 arm7_result = load_system_file((long)nds_system, (undefined8)(unsigned long)(char*)"nds_bios_arm7.bin", 
+                                        nds_system + 0x2204, 0x4000);
+    if ((long)arm7_result < 0) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: Can't find Nintendo ARM7 BIOS. Trying free DraStic ARM7 BIOS.\n");
+        }
+        arm7_result = load_system_file((long)nds_system, (undefined8)(unsigned long)(char*)"drastic_bios_arm7.bin", 
+                                        nds_system + 0x2204, 0x4000);
+    }
+    
+    if ((long)arm9_result < 0 || (long)arm7_result < 0) {
+        bios_result = -1;
         if (debug_enabled) {
             fprintf(stderr, "[DRASTIC] retro_init: WARNING: BIOS files not found. Core will continue but may not work properly.\n");
             fprintf(stderr, "[DRASTIC] retro_init: Please place BIOS files in: %s/system/\n", system_dir);
             fprintf(stderr, "[DRASTIC] retro_init: Required files: nds_bios_arm9.bin (4KB), nds_bios_arm7.bin (16KB)\n");
         }
         // 不返回错误，允许核心继续初始化
+    } else {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: BIOS files loaded successfully\n");
+        }
     }
     
     initialized = 1;
@@ -252,7 +348,7 @@ void retro_deinit(void)
         free(temp_rom_path);
         temp_rom_path = NULL;
     }
-    //free(nds_system);
+    // nds_system 是全局数组，不需要释放
     initialized = 0;
     game_loaded = 0;
     
@@ -273,27 +369,35 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
 
 void retro_get_system_info(struct retro_system_info *info)
 {
+    // 使用静态字符串，确保指针在库的生命周期内有效
+    static const char library_name[] = "DraStic";
+    static const char library_version[] = "r2.5.2.2";
+    static const char valid_extensions[] = "nds|bin";
+    
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_get_system_info: Called\n");
+        fflush(stderr);
     }
     
     if (!info) {
         if (debug_enabled) {
             fprintf(stderr, "[DRASTIC] retro_get_system_info: ERROR: info is NULL!\n");
+            fflush(stderr);
         }
         return;
     }
     
     memset(info, 0, sizeof(*info));
-    info->library_name = "DraStic";
-    info->library_version = "r2.5.2.2";
-    info->valid_extensions = "nds|bin";
+    info->library_name = library_name;
+    info->library_version = library_version;
+    info->valid_extensions = valid_extensions;
     info->need_fullpath = false;
     info->block_extract = false;
     
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_get_system_info: Returning name=%s, version=%s, extensions=%s, need_fullpath=%d\n",
                 info->library_name, info->library_version, info->valid_extensions, info->need_fullpath);
+        fflush(stderr);
     }
 }
 
@@ -333,7 +437,6 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
 
 void retro_set_environment(retro_environment_t cb)
 {
-    /*
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_set_environment: Called with cb=%p\n", (void*)cb);
     }
@@ -366,7 +469,6 @@ void retro_set_environment(retro_environment_t cb)
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_set_environment: Environment callback registered (using software rendering, SET_VARIABLES will be called in retro_init)\n");
     }
-        */
 }
 
 void retro_set_video_refresh(retro_video_refresh_t cb)
@@ -518,7 +620,15 @@ int retro_load_game(const struct retro_game_info *info)
         }
         
         // 检查 ARM7 ROM 地址
-        if (arm7_rom_addr > 0x10000000 && arm7_size > 0) {
+        if (arm7_rom_addr == 0 && arm7_size > 0) {
+            fprintf(stderr, "[DRASTIC] WARNING: ARM7 ROM address is 0 but size is non-zero (0x%08x)!\n",
+                    arm7_size);
+            fprintf(stderr, "[DRASTIC] NOTE: This indicates a malformed ROM header.\n");
+        } else if (arm7_rom_addr == 0 && arm7_size == 0 && arm7_entry != 0) {
+            fprintf(stderr, "[DRASTIC] WARNING: ARM7 ROM address and size are both 0, but entry point is non-zero (0x%08x)!\n",
+                    arm7_entry);
+            fprintf(stderr, "[DRASTIC] NOTE: This ROM header appears inconsistent. The ROM may be corrupted or use an unusual format.\n");
+        } else if (arm7_rom_addr > 0x10000000 && arm7_size > 0) {
             fprintf(stderr, "[DRASTIC] WARNING: ARM7 ROM address (0x%08x) seems unusually high\n",
                     arm7_rom_addr);
         }
@@ -536,20 +646,26 @@ int retro_load_game(const struct retro_game_info *info)
     if (info->path && strlen(info->path) > 0) {
         rom_path = info->path;
     } else {
-        // 创建临时文件路径（跨平台简单实现）
-        char tmpname[L_tmpnam];
-        if (tmpnam(tmpname) == NULL) {
+        // 创建临时文件路径（使用mkstemp替代tmpnam）
+        char tmpname_template[] = "/tmp/drastic_rom_XXXXXX";
+        int fd = mkstemp(tmpname_template);
+        if (fd < 0) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_load_game: ERROR: Failed to create temp file\n");
+            }
             free(rom_data);
             rom_data = NULL;
             return 0;
         }
-        temp_rom_path = (char*)malloc(strlen(tmpname) + 1);
+        close(fd);  // 关闭文件描述符，我们只需要文件名
+        temp_rom_path = (char*)malloc(strlen(tmpname_template) + 1);
         if (!temp_rom_path) {
+            unlink(tmpname_template);
             free(rom_data);
             rom_data = NULL;
             return 0;
         }
-        strcpy(temp_rom_path, tmpname);
+        strcpy(temp_rom_path, tmpname_template);
 
         // 写入 ROM 数据到临时文件
         FILE *fp = fopen(temp_rom_path, "wb");
@@ -590,16 +706,47 @@ int retro_load_game(const struct retro_game_info *info)
     }
     
     // 初始化屏幕（如果需要）
-    initialize_screen((long)nds_system);
+    // 根据 drastic.cpp line 4937，initialize_screen 期望从 nds_system[0x3b2a9a9] 读取一个字节值
+    // 但根据 line 5888，实际写入的是 nds_system[param_1 + 0x362e9a9]，所以偏移是 0x362e9a9
+    // 这个值通常是 8 或 16（对应屏幕位深度），存储为单个字节
+    // 注意：在系统初始化之前，这个值可能未初始化，所以使用默认值
+    uint8_t screen_param_byte = nds_system[0x362e9a9];
+    uint screen_param = (uint)screen_param_byte;
+    if (screen_param == 0 || screen_param > 0x100) {
+        // 如果值无效，使用默认值 8（对应 16 位颜色）
+        screen_param = 8;
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_load_game: Using default screen_param=8 (invalid value at offset 0x362e9a9, read 0x%02x)\n", screen_param_byte);
+        }
+    }
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: Calling initialize_screen with param=%u\n", screen_param);
+    }
+    // 修复 orientation 问题：确保 DAT_040315c4 被正确初始化为 0xffffffffffffffff
+    // 这样在屏幕更新时，如果 DAT_040315c4._4_4_ 不等于 -1，才会被复制到 DAT_040315ac._4_4_
+    // 否则 DAT_040315ac._4_4_ 会保持为 0（默认值）
+    DAT_040315c4 = 0xffffffffffffffffULL;
+    DAT_040315ac = 0;  // 确保 DAT_040315ac 也被初始化为 0
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_load_game: Initialized DAT_040315c4=0x%016llx, DAT_040315ac=0x%016llx\n", 
+                (unsigned long long)DAT_040315c4, (unsigned long long)DAT_040315ac);
+    }
+    initialize_screen(screen_param);
     set_screen_menu_off();
     
     // 加载 NDS 文件
     // 根据 drastic.cpp main 函数，load_nds 的第一个参数是 nds_system + 0x320 (800 in decimal)
-    // 但实际应该传递 nds_system 的偏移，这里使用 0x320
+    // load_nds 会从 param_1 + 0x918 读取指向 nds_system 的指针
+    // 所以我们需要在调用前设置这个指针
+    long load_nds_param = (long)nds_system + 0x320;
+    *(long *)(load_nds_param + 0x918) = (long)nds_system;  // 设置指向 nds_system 的指针
+    
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_load_game: calling load_nds with path=%s\n", rom_path);
+        fprintf(stderr, "[DRASTIC] retro_load_game: load_nds_param=%p, nds_system pointer at offset 0x918=%p\n",
+                (void*)load_nds_param, (void*)*(long *)(load_nds_param + 0x918));
     }
-    int result = load_nds((long)nds_system + 0x320, (char *)rom_path);
+    int result = load_nds(load_nds_param, (char *)rom_path);
     
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_load_game: load_nds returned: %d\n", result);
@@ -860,12 +1007,10 @@ static void update_ds_input(void)
     
     ds_input_state = input;
     
-    // 更新 drastic 的输入状态
-    // 使用辅助函数设置输入状态
-    drastic_set_input_state(input);
-    
-    // 调用 update_input 以更新输入系统
+    // 调用 update_input 以更新输入系统（由 drastic.cpp 提供）
     // update_input 的参数是 nds_system + 0xAAA (2730 in decimal)
+    // 注意：update_input 在 drastic.cpp 中定义，这里直接调用
+    extern void update_input(long param_1);
     long input_offset = (long)nds_system + 0xAAA;
     update_input(input_offset);
 }
@@ -1059,8 +1204,9 @@ void retro_run(void)
     } else {
         // 重编译器模式
         // 从 nds_system 的偏移 0x57482784 获取 translate_cache
-        undefined8 translate_cache = *(undefined8 *)(nds_system + 0x57482784);
-        recompiler_entry(nds_system, translate_cache);
+        //undefined8 translate_cache = *(undefined8 *)(nds_system + 0x57482784);
+        //recompiler_entry(nds_system, translate_cache);
+        cpu_next_action_arm7_to_event_update(nds_system);
     }
     
     // 更新屏幕（渲染）
@@ -1101,15 +1247,37 @@ void retro_run(void)
         void *screen0_ptr = get_screen_ptr(0);
         if (debug_enabled && frame_count <= 5) {
             fprintf(stderr, "[DRASTIC] Screen 0 ptr: %p\n", screen0_ptr);
+            if (screen0_ptr == NULL) {
+                fprintf(stderr, "[DRASTIC] ERROR: Screen 0 ptr is NULL! Screen data will be empty.\n");
+            }
         }
-        screen_copy16(screen0_buffer, 0);
+        if (screen0_ptr == NULL) {
+            // 如果屏幕指针为 NULL，填充黑色
+            memset(screen0_buffer, 0, sizeof(screen0_buffer));
+            if (debug_enabled && frame_count <= 5) {
+                fprintf(stderr, "[DRASTIC] WARNING: Screen 0 ptr is NULL, filling with black\n");
+            }
+        } else {
+            screen_copy16(screen0_buffer, 0);
+        }
         
         // 复制下屏（screen 1）
         void *screen1_ptr = get_screen_ptr(1);
         if (debug_enabled && frame_count <= 5) {
             fprintf(stderr, "[DRASTIC] Screen 1 ptr: %p\n", screen1_ptr);
+            if (screen1_ptr == NULL) {
+                fprintf(stderr, "[DRASTIC] ERROR: Screen 1 ptr is NULL! Screen data will be empty.\n");
+            }
         }
-        screen_copy16(screen1_buffer, 1);
+        if (screen1_ptr == NULL) {
+            // 如果屏幕指针为 NULL，填充黑色
+            memset(screen1_buffer, 0, sizeof(screen1_buffer));
+            if (debug_enabled && frame_count <= 5) {
+                fprintf(stderr, "[DRASTIC] WARNING: Screen 1 ptr is NULL, filling with black\n");
+            }
+        } else {
+            screen_copy16(screen1_buffer, 1);
+        }
         
         // 检查屏幕缓冲区内容（前几个像素）
         if (debug_enabled && frame_count <= 3) {
@@ -1119,22 +1287,34 @@ void retro_run(void)
                     screen1_buffer[0], screen1_buffer[1], screen1_buffer[2], screen1_buffer[3]);
             
             // 检查屏幕缓冲区是否在 nds_system 范围内
-            unsigned long screen0_addr = (unsigned long)screen0_ptr;
-            unsigned long screen1_addr = (unsigned long)screen1_ptr;
-            unsigned long nds_system_addr = (unsigned long)nds_system;
-            unsigned long nds_system_end = nds_system_addr + 62042112;
-            
-            fprintf(stderr, "[DRASTIC] Screen 0 addr: %p, nds_system: %p-%p, offset: 0x%lx\n",
-                    screen0_ptr, (void*)nds_system_addr, (void*)nds_system_end,
-                    screen0_addr - nds_system_addr);
-            fprintf(stderr, "[DRASTIC] Screen 1 addr: %p, offset: 0x%lx\n",
-                    screen1_ptr, screen1_addr - nds_system_addr);
+            if (screen0_ptr != NULL) {
+                unsigned long screen0_addr = (unsigned long)screen0_ptr;
+                unsigned long nds_system_addr = (unsigned long)nds_system;
+                unsigned long nds_system_end = nds_system_addr + 62042112;
+                
+                fprintf(stderr, "[DRASTIC] Screen 0 addr: %p, nds_system: %p-%p, offset: 0x%lx\n",
+                        screen0_ptr, (void*)nds_system_addr, (void*)nds_system_end,
+                        screen0_addr - nds_system_addr);
+            }
+            if (screen1_ptr != NULL) {
+                unsigned long screen1_addr = (unsigned long)screen1_ptr;
+                unsigned long nds_system_addr = (unsigned long)nds_system;
+                
+                fprintf(stderr, "[DRASTIC] Screen 1 addr: %p, offset: 0x%lx\n",
+                        screen1_ptr, screen1_addr - nds_system_addr);
+            }
             
             // 检查屏幕缓冲区中间和末尾的像素
             fprintf(stderr, "[DRASTIC] Screen 0 middle pixels (idx 16384-16387): 0x%04x 0x%04x 0x%04x 0x%04x\n",
                     screen0_buffer[16384], screen0_buffer[16385], screen0_buffer[16386], screen0_buffer[16387]);
             fprintf(stderr, "[DRASTIC] Screen 0 last 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
                     screen0_buffer[49148], screen0_buffer[49149], screen0_buffer[49150], screen0_buffer[49151]);
+            
+            // 检查 DAT_04031528 数组状态
+            fprintf(stderr, "[DRASTIC] DAT_04031528[0]=%p, DAT_04031528[1]=%p, DAT_04031598=%p\n",
+                    DAT_04031528[0], DAT_04031528[1], DAT_04031598);
+            fprintf(stderr, "[DRASTIC] DAT_04031540=%d, DAT_040315cc=%d\n",
+                    DAT_04031540, DAT_040315cc);
         }
 
         // 立即检测是否两个屏幕均全黑（前几帧），以便快速发现渲染问题
@@ -1209,7 +1389,8 @@ void retro_run(void)
         if (!accum) return;
 
         // 先更新所有通道设置，避免在渲染过程中出现需要在循环内部更新并导致死循环的情况
-        spu_update_all_channel_settings(spu_offset);
+        // 注意：spu_update_all_channel_settings 不存在，如果需要可以循环调用 spu_update_channel_settings
+        // spu_update_all_channel_settings(spu_offset);
 
         // 调用 SPU 渲染，将混音结果写入 accum（每元素为两个32位累加值）
         spu_render_samples(spu_offset, (undefined8*)accum, samples_per_frame);
