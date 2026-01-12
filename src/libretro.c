@@ -43,7 +43,8 @@ __attribute__((visibility("default"))) const size_t NDS_SYSTEM_SIZE = 62042112;
 
 // 定义 nds_system 数组（在包含头文件之后，因为头文件中可能有 extern 声明）
 // 在 libretro 模式下，nds_system 应该是一个全局数组
-undefined1 nds_system[NDS_SYSTEM_SIZE];
+// 使用内存对齐属性，确保在某些系统上不会出现对齐问题
+__attribute__((aligned(16))) undefined1 nds_system[NDS_SYSTEM_SIZE];
 
 // 调试输出标志
 static int debug_enabled = 1;  // 可以通过环境变量控制
@@ -75,21 +76,21 @@ static uint16_t ds_input_state = 0xFFFF;
 #define AUDIO_BUFFER_SIZE 4096
 static int16_t audio_buffer[AUDIO_BUFFER_SIZE * 2];  // 立体声：左右声道  // 初始状态为所有按键未按下（低有效）
 
+// 屏幕缓冲区（用于临时存储屏幕数据，使用堆分配避免栈溢出）
+// 每个屏幕是 256x192 = 49152 像素（16位，即 256*192 = 49152 个 uint16_t）
+#define SCREEN_BUFFER_SIZE (256 * 192)
+static uint16_t *screen0_buffer = NULL;
+static uint16_t *screen1_buffer = NULL;
+
 // 环境设置标志，确保环境设置只执行一次
 static int environment_set = 0;
+// AV 信息设置标志，确保 AV 信息只在 video_cb 设置后设置
+static int av_info_set = 0;
 
-// 硬件渲染回调结构（全局保存，供 RetroArch 访问）
-static struct retro_hw_render_callback hw_render_cb;
-
-// 硬件渲染回调函数：返回当前帧缓冲区地址
-// 这个函数用于满足 RetroArch 的硬件渲染回调要求
-// 即使我们使用软件渲染，RetroArch 也可能尝试调用这个函数
-static uintptr_t get_current_framebuffer_cb(void)
-{
-    // 返回当前帧缓冲区的地址（转换为 uintptr_t）
-    // 如果 frame_buffer 为 NULL，返回 0
-    return (uintptr_t)frame_buffer;
-}
+// 注意：对于软件渲染核心，不应该声明硬件渲染回调结构
+// RetroArch 在初始化视频驱动时可能会检测到这个结构并尝试使用它
+// 即使我们不调用 SET_HW_RENDER，如果结构存在，RetroArch 仍可能尝试调用其中的回调函数
+// 这会导致段错误（如果回调函数是 NULL）
 
 // 核心选项定义
 // 根据 libretro API，核心选项格式为 "key;Description|value1|value2|..."
@@ -107,12 +108,18 @@ static uintptr_t get_current_framebuffer_cb(void)
 // 所有 libretro API 函数必须使用 C 链接，以便 RetroArch 能够正确找到符号
 extern "C" {
 
-// 添加构造函数，在库加载时输出调试信息
+// 注意：构造函数在库加载时立即执行，此时 RetroArch 可能还没有完全初始化
+// 在某些情况下，构造函数可能会导致堆栈损坏或其他问题
+// 因此，我们完全禁用构造函数，所有初始化都在 retro_init 中进行
+// 如果将来需要构造函数，应该确保它不会影响 RetroArch 的初始化
+/*
 __attribute__((constructor))
 static void drastic_libretro_constructor(void) {
-    fprintf(stderr, "[DRASTIC] Library loaded, constructor called\n");
-    fflush(stderr);
+    // 使用简单的输出，避免复杂的操作
+    const char msg[] = "[DRASTIC] Library loaded, constructor called\n";
+    write(STDERR_FILENO, msg, sizeof(msg) - 1);
 }
+*/
 
 void retro_init(void)
 {
@@ -132,7 +139,16 @@ void retro_init(void)
         fprintf(stderr, "[DRASTIC] retro_init: Allocating frame buffer (%dx%d)\n", frame_width, frame_height);
     }
     // nds_system 是一个全局数组，不需要动态分配，只需要初始化为0
+    // 注意：大数组的 memset 可能需要一些时间，但这是必要的
+    // 使用分段初始化可能更快，但对于大数组，一次性 memset 通常更高效
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Initializing nds_system array (%zu bytes, %zu MB)...\n", 
+                sizeof(nds_system), sizeof(nds_system) / (1024 * 1024));
+    }
     memset(nds_system, 0, sizeof(nds_system));  // 初始化为0
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: nds_system array initialized\n");
+    }
     
     frame_buffer = (uint16_t*)calloc(frame_width * frame_height, sizeof(uint16_t));
     if (!frame_buffer) {
@@ -142,11 +158,40 @@ void retro_init(void)
         return;
     }
     
+    // 分配屏幕缓冲区（使用堆分配避免栈溢出）
+    screen0_buffer = (uint16_t*)calloc(SCREEN_BUFFER_SIZE, sizeof(uint16_t));
+    screen1_buffer = (uint16_t*)calloc(SCREEN_BUFFER_SIZE, sizeof(uint16_t));
+    if (!screen0_buffer || !screen1_buffer) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_init: ERROR: Failed to allocate screen buffers\n");
+        }
+        if (screen0_buffer) free(screen0_buffer);
+        if (screen1_buffer) free(screen1_buffer);
+        screen0_buffer = NULL;
+        screen1_buffer = NULL;
+        if (frame_buffer) {
+            free(frame_buffer);
+            frame_buffer = NULL;
+        }
+        return;
+    }
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: Screen buffers allocated (screen0=%p, screen1=%p)\n",
+                (void*)screen0_buffer, (void*)screen1_buffer);
+    }
+    
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_init: Initializing system...\n");
+        fprintf(stderr, "[DRASTIC] retro_init: nds_system address: %p, size: %zu bytes\n", 
+                (void*)nds_system, sizeof(nds_system));
     }
     // Initialize drastic system (returns void)
+    // 注意：initialize_system 可能会修改 nds_system 的内容
+    // 确保 nds_system 已经正确初始化（已通过 memset 完成）
     initialize_system((long)nds_system);
+    if (debug_enabled) {
+        fprintf(stderr, "[DRASTIC] retro_init: System initialized\n");
+    }
     
     // 加载 BIOS 文件
     // 获取系统目录路径
@@ -281,31 +326,25 @@ void retro_init(void)
     // 这样可以防止 RetroArch 尝试解析可能损坏的配置文件
     // 必须在系统完全初始化后调用，此时 RetroArch 的核心选项管理器已经准备好
     if (environ_cb) {
-        // 在调用 SET_VARIABLES 之前，先设置硬件渲染回调结构
-        // 这可以防止 RetroArch 在处理 SET_VARIABLES 时尝试设置空指针导致段错误
-        // 即使我们使用软件渲染，RetroArch 也可能尝试访问这个回调
-        // 注意：我们不调用 SET_HW_RENDER，因为我们使用软件渲染
-        // 但是，我们确保硬件渲染回调结构已初始化，以防 RetroArch 尝试访问它
-        
+        // 注意：不在 retro_init 中设置任何视频相关的环境变量
+        // SET_PIXEL_FORMAT 和 SET_SYSTEM_AV_INFO 都应该在游戏加载后调用
+        // 在 retro_init 中设置这些会导致 RetroArch 过早尝试初始化视频驱动，而此时视频回调可能还未设置
+        // 这会导致 "Cannot open video driver" 错误
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_init: Hardware render callback initialized (software rendering, get_current_framebuffer=%p)\n", 
-                    (void*)hw_render_cb.get_current_framebuffer);
+            fprintf(stderr, "[DRASTIC] retro_init: Note: Video settings (SET_PIXEL_FORMAT, SET_SYSTEM_AV_INFO) will be set in retro_load_game after game is loaded\n");
+            fprintf(stderr, "[DRASTIC] retro_init: Using software rendering (no hardware render callbacks)\n");
         }
         
         // 定义一个只包含终止符的空数组
         static const struct retro_variable vars;
         
         // 设置空的变量数组，明确告诉 RetroArch 没有核心选项
-        // RetroArch 在处理 SET_VARIABLES 时可能会尝试设置 get_current_framebuffer
-        // 通过提供有效的函数指针，我们可以避免段错误
-        // 注意：如果 RetroArch 尝试用 video_driver_get_current_framebuffer 覆盖我们的函数指针，
-        // 而 video_driver_get_current_framebuffer 是 NULL，就会导致段错误
-        // 这是 RetroArch 的一个已知问题，我们需要确保 video_driver_get_current_framebuffer 不是 NULL
+        // 注意：不在 retro_init 中调用 SET_VARIABLES，因为这可能导致 RetroArch 尝试访问未初始化的硬件渲染回调
         //bool vars_result = environ_cb(RETRO_ENVIRONMENT_SET_VARIABLES, &vars);
         bool vars_result = true;
         
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_init: SET_VARIABLES called with empty array (result=%d)\n", vars_result);
+            fprintf(stderr, "[DRASTIC] retro_init: SET_VARIABLES skipped (will be set later if needed)\n");
         }
         
         // 设置不支持无游戏模式
@@ -313,7 +352,7 @@ void retro_init(void)
         //environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_NO_GAME, &no_content);
         
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_init: SET_SUPPORT_NO_GAME called (no_content=false)\n");
+            fprintf(stderr, "[DRASTIC] retro_init: SET_SUPPORT_NO_GAME skipped (will be set in retro_run)\n");
         }
     }
     
@@ -341,6 +380,16 @@ void retro_deinit(void)
     if (frame_buffer) {
         free(frame_buffer);
         frame_buffer = NULL;
+    }
+    
+    // 释放屏幕缓冲区
+    if (screen0_buffer) {
+        free(screen0_buffer);
+        screen0_buffer = NULL;
+    }
+    if (screen1_buffer) {
+        free(screen1_buffer);
+        screen1_buffer = NULL;
     }
     
     if (temp_rom_path) {
@@ -450,13 +499,10 @@ void retro_set_environment(retro_environment_t cb)
         return;
     }
     
-    // 初始化硬件渲染回调结构，确保所有字段都被正确初始化
-    // 虽然我们使用软件渲染，但 RetroArch 在处理某些环境命令时可能会尝试访问这个结构
-    // 通过完全初始化这个结构，我们可以避免段错误
-    memset(&hw_render_cb, 0, sizeof(hw_render_cb));
-    hw_render_cb.context_type = NULL;  // NULL 明确表示不使用硬件渲染（软件渲染）
-    hw_render_cb.get_current_framebuffer = get_current_framebuffer_cb;  // 提供有效的函数指针，防止 RetroArch 尝试设置 NULL 指针
-    // 其他回调函数指针保持为 NULL/0，因为我们不使用硬件渲染
+    // 对于软件渲染核心，不应该初始化硬件渲染回调结构
+    // RetroArch 在初始化视频驱动时可能会检查并尝试使用硬件渲染回调
+    // 如果回调结构被初始化但某些字段是 NULL，会导致段错误
+    // 因此，我们完全不清除或初始化这个结构，让 RetroArch 知道我们使用纯软件渲染
     // 注意：我们不调用 SET_HW_RENDER，因为我们使用软件渲染
     // 根据 libretro API，核心应该只在需要硬件渲染时调用 SET_HW_RENDER
     // 如果核心不调用 SET_HW_RENDER，RetroArch 会自动使用软件渲染
@@ -780,31 +826,61 @@ int retro_load_game(const struct retro_game_info *info)
     // RetroArch 在处理环境回调时可能会查询核心选项，导致段错误
     // 但是 SET_SYSTEM_AV_INFO 是安全的，必须在游戏加载后立即调用
     // 这样 RetroArch 才能知道游戏已加载并正确初始化显示
+    // 
+    // 重要：确保视频回调已经设置，否则 RetroArch 在初始化视频驱动时可能会出现问题
+    // 如果 video_cb 还没有设置，延迟 SET_SYSTEM_AV_INFO 到 retro_run 中
     if (environ_cb && game_loaded) {
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_load_game: Setting SYSTEM_AV_INFO (safe to call here)\n");
+            fprintf(stderr, "[DRASTIC] retro_load_game: Setting video info (video_cb=%p)\n", (void*)video_cb);
         }
         
-        // 通知 RetroArch 系统 AV 信息（这是安全的，不会触发核心选项查询）
-        struct retro_system_av_info av_info;
-        memset(&av_info, 0, sizeof(av_info));  // 确保结构体被清零
-        retro_get_system_av_info(&av_info);
-        
-        // 保存调用前的值用于调试（因为 RetroArch 可能会修改结构体）
-        unsigned int before_width = av_info.geometry.base_width;
-        unsigned int before_height = av_info.geometry.base_height;
+        // 首先设置像素格式 - 必须在 SET_SYSTEM_AV_INFO 之前设置
+        // 这样 RetroArch 在初始化视频驱动时就知道使用什么像素格式
+        // 使用 RGB565 格式明确表示我们使用软件渲染（不是硬件渲染）
+        unsigned pixel_format = RETRO_PIXEL_FORMAT_RGB565;
+        int pixel_format_result = environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel_format);
         
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_load_game: Before SET_SYSTEM_AV_INFO: geometry=%ux%u, aspect=%.3f, fps=%.2f, sample_rate=%.2f\n",
-                    before_width, before_height, av_info.geometry.aspect_ratio,
-                    av_info.timing.fps, av_info.timing.sample_rate);
+            fprintf(stderr, "[DRASTIC] retro_load_game: SET_PIXEL_FORMAT called (RGB565, result=%d)\n", pixel_format_result);
+            if (!pixel_format_result) {
+                fprintf(stderr, "[DRASTIC] retro_load_game: WARNING: SET_PIXEL_FORMAT returned false, RetroArch may not support RGB565\n");
+            }
         }
         
-        int result = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
-        
-        if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_load_game: SET_SYSTEM_AV_INFO result=%d\n", result);
-            fprintf(stderr, "[DRASTIC] retro_load_game: Note: av_info may be modified by RetroArch after call\n");
+        // 检查视频回调是否已设置
+        // 如果 video_cb 还没有设置，延迟 SET_SYSTEM_AV_INFO 到 retro_run 中
+        // 这样可以避免 RetroArch 在视频回调未设置时尝试初始化视频驱动
+        if (video_cb) {
+            // 视频回调已设置，可以安全地调用 SET_SYSTEM_AV_INFO
+            struct retro_system_av_info av_info;
+            memset(&av_info, 0, sizeof(av_info));  // 确保结构体被清零
+            retro_get_system_av_info(&av_info);
+            
+            // 保存调用前的值用于调试（因为 RetroArch 可能会修改结构体）
+            unsigned int before_width = av_info.geometry.base_width;
+            unsigned int before_height = av_info.geometry.base_height;
+            
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_load_game: Before SET_SYSTEM_AV_INFO: geometry=%ux%u, aspect=%.3f, fps=%.2f, sample_rate=%.2f\n",
+                        before_width, before_height, av_info.geometry.aspect_ratio,
+                        av_info.timing.fps, av_info.timing.sample_rate);
+            }
+            
+            int result = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+            
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_load_game: SET_SYSTEM_AV_INFO result=%d\n", result);
+                fprintf(stderr, "[DRASTIC] retro_load_game: Note: av_info may be modified by RetroArch after call\n");
+            }
+            
+            av_info_set = 1;  // 标记 AV 信息已设置
+        } else {
+            // 视频回调还未设置，延迟 SET_SYSTEM_AV_INFO 到 retro_run 中
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_load_game: WARNING: video_cb is NULL! Delaying SET_SYSTEM_AV_INFO to retro_run.\n");
+                fprintf(stderr, "[DRASTIC] retro_load_game: This prevents RetroArch from initializing video driver before video callback is set.\n");
+            }
+            av_info_set = 0;  // 标记 AV 信息未设置，将在 retro_run 中设置
         }
         
         // 注意：不在 retro_load_game 中调用 SET_SUPPORT_NO_GAME
@@ -812,7 +888,7 @@ int retro_load_game(const struct retro_game_info *info)
         // SET_SUPPORT_NO_GAME 将在 retro_run 的第一次调用时设置
         // 虽然这可能导致 RetroArch 暂时认为核心支持无游戏模式，但一旦 retro_run 被调用，就会正确设置
         if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_load_game: SET_SUPPORT_NO_GAME and SET_PIXEL_FORMAT will be set in retro_run to avoid SIGSEGV\n");
+            fprintf(stderr, "[DRASTIC] retro_load_game: SET_SUPPORT_NO_GAME will be set in retro_run to avoid SIGSEGV\n");
         }
     }
     
@@ -853,6 +929,7 @@ void retro_unload_game(void)
     
     game_loaded = 0;
     environment_set = 0;  // 重置环境设置标志，以便下次加载游戏时重新设置
+    av_info_set = 0;      // 重置 AV 信息设置标志，以便下次加载游戏时重新设置
     
     if (debug_enabled) {
         fprintf(stderr, "[DRASTIC] retro_unload_game: Game unloaded (game_loaded=%d)\n", game_loaded);
@@ -1140,17 +1217,10 @@ void retro_run(void)
     // 在第一次运行时设置环境变量（延迟设置，避免在加载游戏时崩溃）
     // 这必须在游戏加载后且 retro_run 被调用时进行
     // 此时 RetroArch 的核心选项管理器已经完全初始化，可以安全地调用环境回调
+    // 注意：SET_PIXEL_FORMAT 现在在 retro_load_game 中设置，这里只需要设置 SET_SUPPORT_NO_GAME
     if (!environment_set && environ_cb && game_loaded) {
         if (debug_enabled) {
             fprintf(stderr, "[DRASTIC] retro_run: Setting environment variables (first frame, game_loaded=%d)\n", game_loaded);
-        }
-        
-        // Set pixel format to RGB565
-        unsigned pixel_format = RETRO_PIXEL_FORMAT_RGB565;
-        environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel_format);
-        
-        if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_run: SET_PIXEL_FORMAT called (RGB565)\n");
         }
         
         // Set support no game to false (core requires a game to run)
@@ -1162,18 +1232,47 @@ void retro_run(void)
         
         if (debug_enabled) {
             fprintf(stderr, "[DRASTIC] retro_run: SET_SUPPORT_NO_GAME called (no_content=false)\n");
-        }
-        
-        // 通知 RetroArch 系统 AV 信息（再次设置，确保 RetroArch 知道游戏已加载）
-        struct retro_system_av_info av_info;
-        retro_get_system_av_info(&av_info);
-        environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
-        
-        if (debug_enabled) {
-            fprintf(stderr, "[DRASTIC] retro_run: Environment variables set (no_content=false, av_info updated)\n");
+            fprintf(stderr, "[DRASTIC] retro_run: Note: SET_PIXEL_FORMAT was already set in retro_load_game\n");
         }
         
         environment_set = 1;
+    }
+    
+    // 如果 AV 信息还没有设置（因为 video_cb 在 retro_load_game 时还未设置），现在设置它
+    // 此时 video_cb 应该已经设置，可以安全地调用 SET_SYSTEM_AV_INFO
+    if (!av_info_set && environ_cb && game_loaded && video_cb) {
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: Setting AV info (delayed from retro_load_game, video_cb=%p)\n", (void*)video_cb);
+        }
+        
+        // 确保像素格式已设置（在设置 AV 信息之前）
+        // 这很重要，因为 RetroArch 需要知道使用什么像素格式
+        unsigned pixel_format = RETRO_PIXEL_FORMAT_RGB565;
+        environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &pixel_format);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: SET_PIXEL_FORMAT called (RGB565) before SET_SYSTEM_AV_INFO\n");
+        }
+        
+        struct retro_system_av_info av_info;
+        memset(&av_info, 0, sizeof(av_info));  // 确保结构体被清零
+        retro_get_system_av_info(&av_info);
+        
+        int result = environ_cb(RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO, &av_info);
+        
+        if (debug_enabled) {
+            fprintf(stderr, "[DRASTIC] retro_run: SET_SYSTEM_AV_INFO called (delayed, result=%d)\n", result);
+            fprintf(stderr, "[DRASTIC] retro_run: geometry=%ux%u, aspect=%.3f, fps=%.2f, sample_rate=%.2f\n",
+                    av_info.geometry.base_width, av_info.geometry.base_height, av_info.geometry.aspect_ratio,
+                    av_info.timing.fps, av_info.timing.sample_rate);
+        }
+        
+        av_info_set = 1;
+    } else if (!av_info_set && environ_cb && game_loaded && !video_cb) {
+        // video_cb 仍然未设置，继续等待
+        if (debug_enabled && frame_count <= 10) {
+            fprintf(stderr, "[DRASTIC] retro_run: Still waiting for video_cb (frame=%d, video_cb=%p)\n", frame_count, (void*)video_cb);
+        }
     }
     
     // Poll input
@@ -1210,8 +1309,7 @@ void retro_run(void)
     }
     
     // 更新屏幕（渲染）
-    // 注意：update_screens() 在 libretro 中可能是空函数
-    // 实际的屏幕数据应该由 NDS GPU 在运行过程中更新
+    // update_screens() 会更新屏幕数据，确保在复制之前屏幕数据是最新的
     update_screens();
     
     // 获取视频缓冲区并发送到 RetroArch
@@ -1237,13 +1335,22 @@ void retro_run(void)
                 return;  // 无法分配内存
             }
         }
+        // 检查屏幕缓冲区是否已分配（防御性编程）
+        if (!screen0_buffer || !screen1_buffer) {
+            if (debug_enabled) {
+                fprintf(stderr, "[DRASTIC] retro_run: ERROR: Screen buffers not allocated! screen0=%p, screen1=%p\n",
+                        (void*)screen0_buffer, (void*)screen1_buffer);
+            }
+            return;  // 无法继续，返回
+        }
+        
         // 准备临时缓冲区用于复制屏幕数据
         // screen_copy16 会将屏幕数据复制到提供的缓冲区
         // 每个屏幕是 256x192 = 49152 像素（对于16位，即 256*192 = 49152 个 uint16_t）
-        uint16_t screen0_buffer[256 * 192];
-        uint16_t screen1_buffer[256 * 192];
+        // 注意：这些缓冲区现在使用堆分配（在 retro_init 中分配），避免栈溢出
         
         // 复制上屏（screen 0）
+        // 先获取屏幕指针，检查是否有效
         void *screen0_ptr = get_screen_ptr(0);
         if (debug_enabled && frame_count <= 5) {
             fprintf(stderr, "[DRASTIC] Screen 0 ptr: %p\n", screen0_ptr);
@@ -1251,14 +1358,22 @@ void retro_run(void)
                 fprintf(stderr, "[DRASTIC] ERROR: Screen 0 ptr is NULL! Screen data will be empty.\n");
             }
         }
-        if (screen0_ptr == NULL) {
-            // 如果屏幕指针为 NULL，填充黑色
-            memset(screen0_buffer, 0, sizeof(screen0_buffer));
-            if (debug_enabled && frame_count <= 5) {
-                fprintf(stderr, "[DRASTIC] WARNING: Screen 0 ptr is NULL, filling with black\n");
+        
+        // 尝试复制屏幕数据
+        // screen_copy16 会从内部屏幕缓冲区复制数据到提供的缓冲区
+        // 即使 screen0_ptr 为 NULL，screen_copy16 内部也会处理
+        screen_copy16(screen0_buffer, 0);
+        
+        // 如果复制后缓冲区仍然全为0，可能是屏幕数据未准备好
+        // 检查前几个像素，如果全为0且不是第一帧，可能需要等待
+        if (frame_count > 1) {
+            int has_data = 0;
+            for (int i = 0; i < 256 && !has_data; i++) {
+                if (screen0_buffer[i] != 0) has_data = 1;
             }
-        } else {
-            screen_copy16(screen0_buffer, 0);
+            if (!has_data && screen0_ptr == NULL && debug_enabled && frame_count <= 10) {
+                fprintf(stderr, "[DRASTIC] WARNING: Screen 0 appears empty after copy (frame %d)\n", frame_count);
+            }
         }
         
         // 复制下屏（screen 1）
@@ -1269,14 +1384,19 @@ void retro_run(void)
                 fprintf(stderr, "[DRASTIC] ERROR: Screen 1 ptr is NULL! Screen data will be empty.\n");
             }
         }
-        if (screen1_ptr == NULL) {
-            // 如果屏幕指针为 NULL，填充黑色
-            memset(screen1_buffer, 0, sizeof(screen1_buffer));
-            if (debug_enabled && frame_count <= 5) {
-                fprintf(stderr, "[DRASTIC] WARNING: Screen 1 ptr is NULL, filling with black\n");
+        
+        // 尝试复制屏幕数据
+        screen_copy16(screen1_buffer, 1);
+        
+        // 检查下屏数据
+        if (frame_count > 1) {
+            int has_data = 0;
+            for (int i = 0; i < 256 && !has_data; i++) {
+                if (screen1_buffer[i] != 0) has_data = 1;
             }
-        } else {
-            screen_copy16(screen1_buffer, 1);
+            if (!has_data && screen1_ptr == NULL && debug_enabled && frame_count <= 10) {
+                fprintf(stderr, "[DRASTIC] WARNING: Screen 1 appears empty after copy (frame %d)\n", frame_count);
+            }
         }
         
         // 检查屏幕缓冲区内容（前几个像素）
@@ -1344,26 +1464,36 @@ void retro_run(void)
         }
         
         // 将两个屏幕并排放置到 frame_buffer
-        // 左侧是上屏，右侧是下屏
+        // 左侧是上屏（screen 0），右侧是下屏（screen 1）
+        // 每个屏幕是 256x192，组合后是 512x192
+        // 使用 memcpy 逐行复制，确保数据正确对齐
         for (int y = 0; y < 192; y++) {
-            // 复制上屏的一行（左侧）
-            memcpy(frame_buffer + y * frame_width, 
-                   screen0_buffer + y * 256, 
-                   256 * sizeof(uint16_t));
+            // 复制上屏的一行到左侧（y * frame_width 是当前行的起始位置）
+            uint16_t *dst_left = frame_buffer + y * frame_width;
+            uint16_t *src_screen0 = screen0_buffer + y * 256;
+            memcpy(dst_left, src_screen0, 256 * sizeof(uint16_t));
             
-            // 复制下屏的一行（右侧）
-            memcpy(frame_buffer + y * frame_width + 256, 
-                   screen1_buffer + y * 256, 
-                   256 * sizeof(uint16_t));
+            // 复制下屏的一行到右侧（偏移256像素）
+            uint16_t *dst_right = frame_buffer + y * frame_width + 256;
+            uint16_t *src_screen1 = screen1_buffer + y * 256;
+            memcpy(dst_right, src_screen1, 256 * sizeof(uint16_t));
         }
         
         // 发送到 RetroArch
         // 注意：即使屏幕是黑色的，也要发送，这样 RetroArch 才能显示窗口
+        // pitch 是每行的字节数，对于 RGB565 格式，pitch = width * 2
+        size_t pitch = frame_width * sizeof(uint16_t);
         if (debug_enabled && frame_count <= 5) {
             fprintf(stderr, "[DRASTIC] Calling video_cb: width=%d, height=%d, pitch=%zu\n",
-                    frame_width, frame_height, frame_width * sizeof(uint16_t));
+                    frame_width, frame_height, pitch);
+            // 检查 frame_buffer 的前几个像素值
+            fprintf(stderr, "[DRASTIC] Frame buffer first 4 pixels: 0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    frame_buffer[0], frame_buffer[1], frame_buffer[2], frame_buffer[3]);
         }
-        video_cb(frame_buffer, frame_width, frame_height, frame_width * sizeof(uint16_t));
+        
+        // 调用视频回调函数，将画面数据发送给 RetroArch
+        // RetroArch 会负责将数据渲染到屏幕上
+        video_cb(frame_buffer, frame_width, frame_height, pitch);
         
         if (debug_enabled && frame_count == 5) {
             fprintf(stderr, "[DRASTIC] First 5 frames processed, reducing debug output\n");

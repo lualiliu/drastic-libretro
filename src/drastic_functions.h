@@ -3764,6 +3764,14 @@ void map_memory_page_from_memory_map(long param_1,ulong param_2)
       }
       return;
     }
+    // 检查 deref_b04010 是否是标记值 0x4000000000000000（表示未映射）
+    if (deref_b04010 == 0x4000000000000000ULL) {
+      // 这是正常的标记值，表示内存未映射，直接设置结果并返回
+      if (param_1_in_range) {
+        *(undefined8 *)(param_1 + uVar3 * 8) = 0x4000000000000000;
+      }
+      return;
+    }
     // 检查 deref_b04010 + 0x210c 是否在有效范围内
     if (deref_b04010 < 0x1000000 || deref_b04010 > 0x7fffffffffffULL) {
       fprintf(stderr, "[DRASTIC] map_memory_page_from_memory_map: ERROR: deref_b04010 (0x%lx) appears invalid\n", deref_b04010);
@@ -16425,6 +16433,8 @@ void initialize_memory_map_arm7(undefined8 *param_1)
 {
   undefined8 uVar1;
   
+  fprintf(stderr, "[DRASTIC] initialize_memory_map_arm7: ENTRY (param_1=0x%lx)\n", (unsigned long)param_1);
+  fflush(stderr);
   puts("  Initializing ARM7 bus-level memory map.");
   *(undefined4 *)(param_1 + 0x1f8d3) = 0x3fff;
   param_1[0x1f8d4] = param_1 + 0x2204;
