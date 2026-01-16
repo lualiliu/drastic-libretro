@@ -5695,6 +5695,16 @@ void update_screen(ulong param_1)
   param_1 = param_1 & 0xffffffff;
   lVar4 = param_1 * 0x28;
   local_8 = __stack_chk_guard;
+  
+#ifdef DRASTIC_LIBRETRO
+  // libretro 模式：不需要更新 SDL 纹理
+  // 屏幕数据已经在模拟器运行过程中更新到 DAT_04031528 数组中
+  // RetroArch 会通过 screen_copy16() 直接获取原始屏幕缓冲区数据
+  // 跳过所有 SDL 操作以提高性能
+  (void)iVar1; (void)uVar2; (void)uVar3; (void)iVar5; (void)uVar6;
+  (void)local_14; (void)local_10;
+#else
+  // 非 libretro 模式：更新 SDL 纹理
   if ((&DAT_04031540)[lVar4] != '\0') {
     iVar1 = (uint)(byte)(&DAT_04031541)[lVar4] * 0xc0 + 0xc0;
     uVar2 = ((byte)(&DAT_04031541)[lVar4] + 1) * 0x100 * DAT_040315a8;
@@ -5716,6 +5726,11 @@ void update_screen(ulong param_1)
     }
     SDL_UnlockTexture((&SDL_screen)[param_1 * 5]);
   }
+#endif // DRASTIC_LIBRETRO
+  
+  if (local_8 != __stack_chk_guard) {
+    __stack_chk_fail();
+  }
   return;
 }
 
@@ -5723,9 +5738,16 @@ void update_screen(ulong param_1)
 void update_screen_menu(void)
 
 {
+#ifdef DRASTIC_LIBRETRO
+  // libretro 模式：不需要更新菜单屏幕
+  // RetroArch 会处理所有渲染，菜单功能由 RetroArch 的菜单系统提供
+  // 跳过所有 SDL 操作以提高性能
+#else
+  // 非 libretro 模式：更新菜单屏幕
   SDL_UpdateTexture(DAT_04031580,0,DAT_04031598,0x640);
   SDL_RenderCopy(DAT_04031578,DAT_04031580,0,0);
   SDL_RenderPresent(DAT_04031578);
+#endif // DRASTIC_LIBRETRO
   return;
 }
 

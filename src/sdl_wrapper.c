@@ -22,11 +22,22 @@ extern retro_video_refresh_t video_cb;
 extern retro_environment_t environ_cb;
 
 // SDL2 函数实现（存根/包装）
+// 使用 __attribute__((visibility("default"))) 确保符号被导出并优先使用
+// 在 libretro 模式下，这些函数不应该创建真实的窗口
+// 使用 __attribute__((constructor_priority(1000))) 确保这些函数在库加载时被优先注册
+__attribute__((visibility("default")))
+__attribute__((noinline))  // 防止内联，确保函数被调用
+__attribute__((used))  // 确保函数不被优化掉
 SDL_Window* SDL_CreateWindow(const char* title, int x, int y, int w, int h, uint32_t flags) {
     (void)title; (void)x; (void)y; (void)w; (void)h; (void)flags;
     // 在 libretro 中，窗口由 RetroArch 管理
     // 返回一个非 NULL 指针以满足 drastic.cpp 的检查
+    // 注意：这个函数不应该创建真实的窗口，只是返回一个 dummy 指针
     static char dummy_window[1];
+    // 输出调试信息，确认这个存根实现被调用
+    fprintf(stderr, "[DRASTIC] SDL_CreateWindow called (libretro mode, title=%s, returning dummy pointer %p)\n", 
+            title ? title : "(null)", (void*)dummy_window);
+    fflush(stderr);
     return (SDL_Window*)dummy_window;
 }
 
@@ -94,14 +105,26 @@ void SDL_RenderPresent(SDL_Renderer* renderer) {
     // 在 libretro 中，渲染由 retro_run 中的 video_cb 处理
 }
 
+__attribute__((visibility("default")))
+__attribute__((noinline))
+__attribute__((used))
 void SDL_ShowWindow(SDL_Window* window) {
     (void)window;
     // libretro 中窗口由 RetroArch 管理
+    // 不执行任何操作，避免显示窗口
+    fprintf(stderr, "[DRASTIC] SDL_ShowWindow called (libretro mode, ignoring)\n");
+    fflush(stderr);
 }
 
+__attribute__((visibility("default")))
+__attribute__((noinline))
+__attribute__((used))
 void SDL_RaiseWindow(SDL_Window* window) {
     (void)window;
     // libretro 中窗口由 RetroArch 管理
+    // 不执行任何操作，避免显示窗口
+    fprintf(stderr, "[DRASTIC] SDL_RaiseWindow called (libretro mode, ignoring)\n");
+    fflush(stderr);
 }
 
 int SDL_SetWindowFullscreen(SDL_Window* window, uint32_t flags) {
@@ -132,8 +155,15 @@ void SDL_Quit(void) {
     // libretro 中不需要退出 SDL
 }
 
+__attribute__((visibility("default")))
+__attribute__((noinline))
+__attribute__((used))
 int SDL_Init(uint32_t flags) {
     (void)flags;
+    // 在 libretro 模式下，不初始化 SDL 视频子系统
+    // 返回成功，但不执行任何实际操作
+    fprintf(stderr, "[DRASTIC] SDL_Init called (libretro mode, flags=0x%x, returning success without initialization)\n", flags);
+    fflush(stderr);
     return 0;  // 成功
 }
 
